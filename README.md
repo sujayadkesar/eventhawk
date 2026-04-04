@@ -267,7 +267,7 @@ Juggernaut Mode has been rebuilt from the ground up around an **Arrow in-memory 
 
 ---
 
-### PowerShell History Extraction — new in v1.2
+### PowerShell History Extraction — new in v1.3
 
 A new **Analysis → PowerShell History** menu item reconstructs the full PowerShell forensic picture from loaded EVTX files without any extra tooling.
 
