@@ -877,8 +877,9 @@ class ArrowTableModel(QAbstractTableModel):
                 return None
 
         record_id   = _col("record_id")
+        source_file = _col("source_file") or ""
         ts_raw      = _col("timestamp_utc") or ""
-        event_data_json = self._load_event_data(record_id)
+        event_data_json = self._load_event_data(record_id, source_file)
 
         return {
             "record_id":      record_id,
@@ -889,7 +890,7 @@ class ArrowTableModel(QAbstractTableModel):
             "computer":       _col("computer") or "",
             "channel":        _col("channel") or "",
             "user_id":        _col("user_id") or "",
-            "source_file":    _col("source_file") or "",
+            "source_file":    source_file,
             "provider":       _col("provider") or "",
             "keywords":       _col("keywords") or "",
             "task":           _col("task") or 0,
@@ -901,15 +902,22 @@ class ArrowTableModel(QAbstractTableModel):
             "_heavyweight":   True,
         }
 
-    def _load_event_data(self, record_id: int | None) -> str:
-        """Lazy-load event_data_json for one record_id from Parquet (<20 ms on SSD)."""
+    def _load_event_data(self, record_id: int | None, source_file: str = "") -> str:
+        """Lazy-load event_data_json for one (source_file, record_id) from Parquet.
+
+        source_file is required to avoid returning data from a different file that
+        happens to share the same record_id (record_id is only unique per file).
+        The cache key is (source_file, record_id) for the same reason.
+        """
         if record_id is None:
             return "{}"
 
+        cache_key = (source_file, record_id)
+
         # LRU cache hit.
-        if record_id in self._event_data_cache:
-            self._event_data_cache.move_to_end(record_id)
-            return self._event_data_cache[record_id]
+        if cache_key in self._event_data_cache:
+            self._event_data_cache.move_to_end(cache_key)
+            return self._event_data_cache[cache_key]
 
         val = "{}"
         try:
@@ -923,22 +931,30 @@ class ArrowTableModel(QAbstractTableModel):
             quoted = ", ".join(f"'{p.replace(chr(39), chr(39)*2)}'" for p in shards)
             con = duckdb.connect()
             try:
-                row = con.execute(
-                    f"SELECT event_data_json FROM parquet_scan([{quoted}]) "
-                    f"WHERE record_id = ?",
-                    [record_id],
-                ).fetchone()
+                if source_file:
+                    row = con.execute(
+                        f"SELECT event_data_json FROM parquet_scan([{quoted}]) "
+                        f"WHERE record_id = ? AND source_file = ?",
+                        [record_id, source_file],
+                    ).fetchone()
+                else:
+                    row = con.execute(
+                        f"SELECT event_data_json FROM parquet_scan([{quoted}]) "
+                        f"WHERE record_id = ?",
+                        [record_id],
+                    ).fetchone()
             finally:
                 con.close()
             if row and row[0]:
                 val = row[0]
         except Exception as exc:
-            logger.debug("event_data lazy-load failed for record_id=%s: %s", record_id, exc)
+            logger.debug("event_data lazy-load failed for record_id=%s source_file=%s: %s",
+                         record_id, source_file, exc)
 
         # LRU eviction.
         if len(self._event_data_cache) >= _EVENT_DATA_CACHE_SIZE:
             self._event_data_cache.popitem(last=False)
-        self._event_data_cache[record_id] = val
+        self._event_data_cache[cache_key] = val
         return val
 
     # ── Lifecycle ─────────────────────────────────────────────────────────────

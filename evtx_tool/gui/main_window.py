@@ -3197,6 +3197,12 @@ class MainWindow(QMainWindow):
         )
         self._jm_file_models.append(file_model)
 
+        # Inherit active session filter so a newly opened per-file tab is
+        # already filtered to the same session as the merged view.
+        _active_keys = getattr(self, "_active_jm_session_keys", frozenset())
+        if _active_keys:
+            file_model.apply_bookmark_filter(_active_keys)
+
         file_view = self._create_configured_table(file_model)
         file_view.horizontalHeader().setSortIndicatorShown(False)
         self._apply_col_visibility(file_view, self._visible_cols)
@@ -5396,6 +5402,7 @@ class MainWindow(QMainWindow):
                 _hw_model.clear_record_id_filter()
                 for _fm in self._jm_file_models:
                     _fm.clear_record_id_filter()
+                self._active_jm_session_keys = frozenset()
                 self._update_session_filter_badge(None, None)
                 self._update_count_label()
                 return
@@ -5428,6 +5435,8 @@ class MainWindow(QMainWindow):
             _hw_model.apply_bookmark_filter(composite_keys)
             for _fm in self._jm_file_models:
                 _fm.apply_bookmark_filter(composite_keys)
+            # Remember active keys so tabs opened later can inherit this filter.
+            self._active_jm_session_keys = composite_keys
             self._update_session_filter_badge(logon_id, session_info)
             self._update_count_label()
 
@@ -5453,8 +5462,11 @@ class MainWindow(QMainWindow):
     def _clear_session_filter(self) -> None:
         """Clear the session filter from all proxies and hide the badge."""
         if self._hw_model is not None:
-            # Juggernaut mode — filter lives on the ArrowTableModel
+            # Juggernaut mode — filter lives on ArrowTableModels (merged + per-file tabs)
             self._hw_model.clear_record_id_filter()
+            for _fm in getattr(self, "_jm_file_models", []):
+                _fm.clear_record_id_filter()
+            self._active_jm_session_keys = frozenset()
             self._update_session_filter_badge(None, None)
             self._update_count_label()
             return
