@@ -409,7 +409,7 @@ class _JMProxyShim:
     # Called by _set_session_filter / _clear_session_filter
     # Session filter for JM is handled at the top-level _hw_model; per-file
     # tabs don't need it separately.
-    def set_session_filter(self, _logon_id) -> None:
+    def set_session_filter(self, _logon_id, _computer=None) -> None:
         pass
 
     # Called by bookmark / IOC pivot
@@ -1355,7 +1355,7 @@ class _LogonSessionDialog(QDialog):
                 )
                 item.setTextAlignment(align | Qt.AlignmentFlag.AlignVCenter)
                 # Store LogonId in UserRole for retrieval on click
-                item.setData(Qt.ItemDataRole.UserRole, s["lid"])
+                item.setData(Qt.ItemDataRole.UserRole, (s["computer"], s["lid"]))
                 if row_bg:
                     item.setBackground(row_bg)
                 if col == 10 and s["has_dangerous"]:   # ⚠ Dangerous column (shifted +1)
@@ -1388,10 +1388,18 @@ class _LogonSessionDialog(QDialog):
         item = self._tbl.item(row, 4)   # Session ID column (index 4 after Initiation added)
         if not item:
             return None
-        lid = item.data(Qt.ItemDataRole.UserRole) or item.text()
-        for s in self._all_sessions:
-            if s["lid"] == lid:
-                return s
+        key = item.data(Qt.ItemDataRole.UserRole)
+        if isinstance(key, tuple):
+            computer_key, lid = key
+            for s in self._all_sessions:
+                if s["lid"] == lid and s["computer"] == computer_key:
+                    return s
+        else:
+            # Fallback for any cell whose UserRole was not set (shouldn't happen).
+            lid = key or item.text()
+            for s in self._all_sessions:
+                if s["lid"] == lid:
+                    return s
         return None
 
     def _on_filter_clicked(self) -> None:
@@ -5414,7 +5422,7 @@ class MainWindow(QMainWindow):
         # files happen to share the same record_id value.
         _LOGON_ID_SKIP = _LogonSessionDialog._SKIP_IDS
         events: list[dict] = []
-        _lid_to_keys: dict[str, set] = {}   # lid → set of (source_file, record_id)
+        _lid_to_keys: dict[tuple[str, str], set] = {}   # (computer, lid) → set of (source_file, record_id)
 
         for src_file, rec_id, ev_id, computer, ts_utc, ed_json in _rows:
             try:
@@ -5435,7 +5443,7 @@ class MainWindow(QMainWindow):
             else:
                 lid = str(ed.get("SubjectLogonId", "")).strip()
             if lid and lid not in _LOGON_ID_SKIP:
-                _lid_to_keys.setdefault(lid, set()).add((src_file or "", rec_id))
+                _lid_to_keys.setdefault((computer or "", lid), set()).add((src_file or "", rec_id))
 
         # Capture for closure
         _shard_list_captured = shard_list
@@ -5473,8 +5481,9 @@ class MainWindow(QMainWindow):
                     (r[0] or "", r[1]) for r in _rid_rows if r[1] is not None
                 )
             except Exception:
-                # Fallback: use only the pre-seeded composite keys from the 4 event types
-                composite_keys = frozenset(_lid_to_keys.get(logon_id, set()))
+                # Fallback: use only the pre-seeded composite keys from the 4 event types,
+                # scoped to the originating host so cross-host LUID reuse is not conflated.
+                composite_keys = frozenset(_lid_to_keys.get((_computer, logon_id), set()))
 
             if not composite_keys:
                 QMessageBox.information(self, "Logon Sessions",
@@ -5490,11 +5499,14 @@ class MainWindow(QMainWindow):
             self._update_session_filter_badge(logon_id, session_info)
             self._update_count_label()
 
+        # Close any existing session browser (normal or JM) before opening a new one.
+        self._close_logon_sessions_dlg()
         dlg = _LogonSessionDialog(
             events=events,
             on_filter_fn=_jm_session_filter,
             parent=self,
         )
+        self._logon_sessions_dlg = dlg
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
