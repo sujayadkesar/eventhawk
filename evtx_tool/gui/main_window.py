@@ -1310,6 +1310,24 @@ class _LogonSessionDialog(QDialog):
                     "linked_lid":          sess.get("linked_lid", ""),
                 })
 
+        # Post-pass: compute union time window for linked sibling pairs so the
+        # session filter can span both sessions without cutting off events from
+        # whichever sibling has the wider scope.
+        _by_cl: dict[tuple[str, str], dict] = {
+            (s["computer"], s["lid"]): s for s in result
+        }
+        for _sd in result:
+            _lnk = _sd.get("linked_lid", "")
+            if not _lnk:
+                continue
+            _sib = _by_cl.get((_sd["computer"], _lnk))
+            if not _sib:
+                continue
+            _starts = [t for t in (_sd["scope_start_ts"], _sib["scope_start_ts"]) if t]
+            _ends   = [t for t in (_sd["scope_end_ts"],   _sib["scope_end_ts"])   if t]
+            _sd["linked_scope_start_ts"] = min(_starts) if _starts else ""
+            _sd["linked_scope_end_ts"]   = max(_ends)   if _ends   else ""
+
         result.sort(key=lambda s: (s["scope_start_ts"], s["computer"], s["lid"]))
         return result
 
@@ -5655,6 +5673,15 @@ class MainWindow(QMainWindow):
             _end_ts = (session_info or {}).get("scope_end_ts", "")
             _end_inclusive = bool((session_info or {}).get("scope_end_inclusive"))
             _linked_lid = (session_info or {}).get("linked_lid", "") or ""
+            if _linked_lid:
+                # Widen to union of both sibling windows.
+                _ls = (session_info or {}).get("linked_scope_start_ts") or ""
+                _le = (session_info or {}).get("linked_scope_end_ts") or ""
+                if _ls and (not _start_ts or _ls < _start_ts):
+                    _start_ts = _ls
+                if _le and (not _end_ts or _le > _end_ts):
+                    _end_ts = _le
+                    _end_inclusive = True
             try:
                 _c = _duckdb.connect()
                 if _linked_lid:
@@ -5734,6 +5761,16 @@ class MainWindow(QMainWindow):
         scope_end_ts = (session_info or {}).get("scope_end_ts") if logon_id else None
         scope_end_inclusive = bool((session_info or {}).get("scope_end_inclusive")) if logon_id else False
         linked_lid = (session_info or {}).get("linked_lid", "") or None if logon_id else None
+        if linked_lid and logon_id:
+            # Widen to union of both sibling windows so events belonging to
+            # the linked session that fall outside the primary window are kept.
+            _ls = (session_info or {}).get("linked_scope_start_ts") or ""
+            _le = (session_info or {}).get("linked_scope_end_ts") or ""
+            if _ls and (not scope_start_ts or _ls < scope_start_ts):
+                scope_start_ts = _ls
+            if _le and (not scope_end_ts or _le > scope_end_ts):
+                scope_end_ts = _le
+                scope_end_inclusive = True
         self._proxy_model.set_session_filter(
             logon_id, computer, scope_start_ts, scope_end_ts, scope_end_inclusive,
         )
