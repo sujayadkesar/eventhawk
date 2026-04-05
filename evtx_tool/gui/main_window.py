@@ -1026,6 +1026,8 @@ class _LogonSessionDialog(QDialog):
         "9":  "NewCredentials (9)",
         "10": "RemoteInteractive / RDP (10)",
         "11": "CachedInteractive (11)",
+        "12": "CachedRemoteInteractive (12)",
+        "13": "CachedUnlock (13)",
     }
 
     # Human-readable explanation of how the session was initiated
@@ -1039,6 +1041,8 @@ class _LogonSessionDialog(QDialog):
         "9":  "RunAs /netonly — local identity kept, network uses new creds",
         "10": "Remote Desktop (RDP) / Remote Assistance session",
         "11": "Cached domain credentials used (DC unreachable)",
+        "12": "Cached RDP credentials used (DC unreachable)",
+        "13": "Workstation unlock using cached credentials",
     }
 
     _DANGEROUS_PRIVS = frozenset({
@@ -3445,6 +3449,12 @@ class MainWindow(QMainWindow):
         if self._view_mode == "separate" and self._hw_model is None:
             QTimer.singleShot(0, self._refresh_attack_tab)
 
+        # Invalidate the logon-session browser cache when the active tab changes
+        # in normal mode.  The dialog was built from self._active_events, which
+        # now refers to a different dataset, so the cached dialog is stale.
+        if self._hw_model is None:
+            self._logon_sessions_dlg = None
+
     def _remove_loaded_file(self, filepath: str) -> None:
         """Remove a file completely — close tab + free memory."""
         self._close_file_tab(filepath)
@@ -5324,11 +5334,13 @@ class MainWindow(QMainWindow):
         # Escape shard paths for DuckDB list literal
         shard_list = "[" + ", ".join(f"'{p.replace(chr(39), chr(39)*2)}'" for p in shards) + "]"
 
-        # Query only the 4 logon-related event types (fast — column-pruned Parquet scan)
+        # Query only the 4 logon-related event types (fast — column-pruned Parquet scan).
+        # source_file is selected so we can build composite (source_file, record_id) keys
+        # that are unique across multi-file loads (record_id alone is not unique per file).
         try:
             _con = _duckdb.connect()
             _rows = _con.execute(
-                f"SELECT record_id, event_id, computer, timestamp_utc, event_data_json "
+                f"SELECT source_file, record_id, event_id, computer, timestamp_utc, event_data_json "
                 f"FROM parquet_scan({shard_list}) "
                 f"WHERE event_id IN (4624, 4634, 4672, 4688) "
                 f"ORDER BY timestamp_utc"
@@ -5347,30 +5359,33 @@ class MainWindow(QMainWindow):
             return
 
         # Build event dicts in the format _LogonSessionDialog._build_sessions() expects.
-        # Also accumulate logon_id → set[record_id] for fast filter pre-seeding.
+        # Also accumulate logon_id → set[(source_file, record_id)] composite keys for
+        # fast filter pre-seeding.  Composite keys prevent false matches when different
+        # files happen to share the same record_id value.
         _LOGON_ID_SKIP = _LogonSessionDialog._SKIP_IDS
         events: list[dict] = []
-        _lid_to_rids: dict[str, set] = {}
+        _lid_to_keys: dict[str, set] = {}   # lid → set of (source_file, record_id)
 
-        for rec_id, ev_id, computer, ts_utc, ed_json in _rows:
+        for src_file, rec_id, ev_id, computer, ts_utc, ed_json in _rows:
             try:
                 ed = _json.loads(ed_json) if ed_json else {}
             except Exception:
                 ed = {}
             events.append({
-                "event_id":   ev_id,
-                "computer":   computer or "",
-                "timestamp":  str(ts_utc or ""),
-                "event_data": ed,
-                "_record_id": rec_id,
+                "event_id":    ev_id,
+                "computer":    computer or "",
+                "timestamp":   str(ts_utc or ""),
+                "event_data":  ed,
+                "_record_id":  rec_id,
+                "_source_file": src_file or "",
             })
-            # Collect logon_id → record_id mapping
+            # Collect logon_id → composite key mapping
             if ev_id in (4624, 4634):
                 lid = str(ed.get("TargetLogonId", "")).strip()
             else:
                 lid = str(ed.get("SubjectLogonId", "")).strip()
             if lid and lid not in _LOGON_ID_SKIP:
-                _lid_to_rids.setdefault(lid, set()).add(rec_id)
+                _lid_to_keys.setdefault(lid, set()).add((src_file or "", rec_id))
 
         # Capture for closure
         _shard_list_captured = shard_list
@@ -5379,32 +5394,40 @@ class MainWindow(QMainWindow):
         def _jm_session_filter(logon_id: str | None, session_info: dict | None) -> None:
             if logon_id is None:
                 _hw_model.clear_record_id_filter()
+                for _fm in self._jm_file_models:
+                    _fm.clear_record_id_filter()
                 self._update_session_filter_badge(None, None)
                 self._update_count_label()
                 return
 
             # Query ALL events from Parquet whose event_data references this logon_id.
-            # This is done once per user click so latency is acceptable.
+            # Select source_file too so we build composite (source_file, record_id) keys —
+            # record_id alone is not unique across multi-file loads.
             try:
                 _lid_esc = logon_id.replace("'", "''")
                 _c = _duckdb.connect()
                 _rid_rows = _c.execute(
-                    f"SELECT record_id FROM parquet_scan({_shard_list_captured}) "
+                    f"SELECT source_file, record_id FROM parquet_scan({_shard_list_captured}) "
                     f"WHERE json_extract_string(event_data_json, '$.TargetLogonId') = '{_lid_esc}' "
                     f"   OR json_extract_string(event_data_json, '$.SubjectLogonId') = '{_lid_esc}'"
                 ).fetchall()
                 _c.close()
-                rid_set = frozenset(r[0] for r in _rid_rows if r[0] is not None)
+                composite_keys = frozenset(
+                    (r[0] or "", r[1]) for r in _rid_rows if r[1] is not None
+                )
             except Exception:
-                # Fallback: use only the pre-seeded record IDs from the 4 event types
-                rid_set = frozenset(_lid_to_rids.get(logon_id, set()))
+                # Fallback: use only the pre-seeded composite keys from the 4 event types
+                composite_keys = frozenset(_lid_to_keys.get(logon_id, set()))
 
-            if not rid_set:
+            if not composite_keys:
                 QMessageBox.information(self, "Logon Sessions",
                                         f"No events found for LogonId {logon_id}.")
                 return
 
-            _hw_model.apply_record_id_filter(rid_set)
+            # Apply composite-key filter to merged model and all open per-file JM tabs.
+            _hw_model.apply_bookmark_filter(composite_keys)
+            for _fm in self._jm_file_models:
+                _fm.apply_bookmark_filter(composite_keys)
             self._update_session_filter_badge(logon_id, session_info)
             self._update_count_label()
 
