@@ -936,6 +936,10 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         """Return whether the active session end boundary is inclusive."""
         return self._session_end_inclusive
 
+    def get_session_linked_lid(self) -> str | None:
+        """Return the active sibling split-token session's LogonId, or None."""
+        return self._session_linked_lid
+
     def set_session_linked_lid(self, linked_lid: str | None) -> None:
         """Set the sibling split-token session's LogonId so its events are
         included when the primary session filter is active."""

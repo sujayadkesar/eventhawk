@@ -1215,12 +1215,19 @@ class _LogonSessionDialog(QDialog):
                     continue
                 # Match the sibling whose start time is closest to this session.
                 own_ts = sess.get("first_seen_ts", "")
+                def _ts_dist(ts_a: str, ts_b: str) -> float:
+                    try:
+                        from datetime import datetime as _dt
+                        _fmt = "%Y-%m-%d %H:%M:%S"
+                        return abs((_dt.strptime(ts_a[:19].replace("T", " "), _fmt)
+                                    - _dt.strptime(ts_b[:19].replace("T", " "), _fmt)
+                                    ).total_seconds())
+                    except Exception:
+                        return float("inf")
                 best = min(
                     sibling_list,
-                    key=lambda s: abs(
-                        (s.get("first_seen_ts", "") or "zzzz")
-                        .__gt__(own_ts) and 1 or -1
-                    ) if own_ts else 0,
+                    key=lambda s: _ts_dist(s.get("first_seen_ts", "") or "", own_ts)
+                                  if own_ts else 0.0,
                     default=sibling_list[0],
                 )
                 sess["linked_lid"] = linked_raw
@@ -7075,6 +7082,7 @@ class MainWindow(QMainWindow):
             scope_start_ts = self._proxy_model.get_session_filter_start_ts()
             scope_end_ts   = self._proxy_model.get_session_filter_end_ts()
             scope_end_incl = self._proxy_model.get_session_filter_end_inclusive()
+            linked_lid     = self._proxy_model.get_session_linked_lid()
             if lid:
                 proxy.set_session_filter(
                     lid,
@@ -7083,6 +7091,7 @@ class MainWindow(QMainWindow):
                     scope_end_ts,
                     scope_end_incl,
                 )
+                proxy.set_session_linked_lid(linked_lid)
 
         # ── Tab bar: must be visible so user can navigate between tabs ────────
         # In merged mode the bar is collapsed to save space; un-collapse it now.
