@@ -409,7 +409,14 @@ class _JMProxyShim:
     # Called by _set_session_filter / _clear_session_filter
     # Session filter for JM is handled at the top-level _hw_model; per-file
     # tabs don't need it separately.
-    def set_session_filter(self, _logon_id, _computer=None) -> None:
+    def set_session_filter(
+        self,
+        _logon_id,
+        _computer=None,
+        _start_ts=None,
+        _end_ts=None,
+        _end_inclusive=False,
+    ) -> None:
         pass
 
     # Called by bookmark / IOC pivot
@@ -1067,92 +1074,171 @@ class _LogonSessionDialog(QDialog):
     # ── Session building ───────────────────────────────────────────────────
 
     def _build_sessions(self, events: list[dict]) -> list[dict]:
-        """Scan events and build one session record per unique (computer, LogonId) pair.
+        """Scan events and build concrete session instances per (computer, LogonId).
 
-        Keying by (computer, lid) rather than bare lid prevents events from
-        different hosts that happen to share the same LUID from being merged
-        into a single session row in multi-host EVTX loads.
+        A single (computer, LogonId) bucket is still not enough because the
+        same host can legitimately reuse a LogonId later.  We therefore start a
+        new session instance on every 4624 and attach subsequent 4672 / 4688 /
+        4634 events to the most recent instance for that (computer, LogonId)
+        pair.
         """
-        raw: dict[tuple[str, str], dict] = {}
+        raw: dict[tuple[str, str], list[dict]] = {}
+
+        def _norm_ts(raw_ts: object) -> str:
+            ts = str(raw_ts or "").strip()
+            if not ts:
+                return ""
+            ts = ts.rstrip("Z").replace("T", " ").split(".")[0]
+            return ts[:19]
+
+        def _latest_session(computer: str, lid: str) -> dict | None:
+            sessions = raw.get((computer, lid), [])
+            return sessions[-1] if sessions else None
+
+        def _new_session(computer: str, lid: str) -> dict:
+            sessions = raw.setdefault((computer, lid), [])
+            sess = {
+                "session_key":   (computer, lid, len(sessions)),
+                "logon":         None,
+                "privs":         [],
+                "procs":         [],
+                "logoff":        None,
+                "first_seen_ts": "",
+                "last_seen_ts":  "",
+                "related_keys":  set(),
+            }
+            sessions.append(sess)
+            return sess
+
+        def _touch_session(sess: dict, ev: dict) -> None:
+            ev_ts = _norm_ts(ev.get("timestamp", ""))
+            if ev_ts:
+                if not sess["first_seen_ts"] or ev_ts < sess["first_seen_ts"]:
+                    sess["first_seen_ts"] = ev_ts
+                if not sess["last_seen_ts"] or ev_ts > sess["last_seen_ts"]:
+                    sess["last_seen_ts"] = ev_ts
+            rid = ev.get("_record_id")
+            if rid is not None:
+                sess["related_keys"].add((str(ev.get("_source_file", "") or ""), rid))
+
         for ev in events:
             eid      = ev.get("event_id", 0)
             ed       = ev.get("event_data", {}) or {}
-            computer = ev.get("computer", "")
+            computer = str(ev.get("computer", "") or "")
+
             if eid == 4624:
-                lid = str(ed.get("TargetLogonId",  "")).strip()
-                if lid not in self._SKIP_IDS:
-                    raw.setdefault(
-                        (computer, lid), {"logon": None, "privs": [], "procs": [], "logoff": None}
-                    )["logon"] = ev
-            elif eid == 4672:
+                lid = str(ed.get("TargetLogonId", "")).strip()
+                if lid in self._SKIP_IDS:
+                    continue
+                sess = _new_session(computer, lid)
+                sess["logon"] = ev
+                _touch_session(sess, ev)
+                continue
+
+            if eid == 4672:
                 lid = str(ed.get("SubjectLogonId", "")).strip()
-                if lid not in self._SKIP_IDS:
-                    raw.setdefault(
-                        (computer, lid), {"logon": None, "privs": [], "procs": [], "logoff": None}
-                    )["privs"].append(ev)
-            elif eid == 4688:
+                if lid in self._SKIP_IDS:
+                    continue
+                sess = _latest_session(computer, lid) or _new_session(computer, lid)
+                sess["privs"].append(ev)
+                _touch_session(sess, ev)
+                continue
+
+            if eid == 4688:
                 lid = str(ed.get("SubjectLogonId", "")).strip()
-                if lid not in self._SKIP_IDS:
-                    raw.setdefault(
-                        (computer, lid), {"logon": None, "privs": [], "procs": [], "logoff": None}
-                    )["procs"].append(ev)
-            elif eid == 4634:
-                lid = str(ed.get("TargetLogonId",  "")).strip()
-                if lid not in self._SKIP_IDS:
-                    raw.setdefault(
-                        (computer, lid), {"logon": None, "privs": [], "procs": [], "logoff": None}
-                    )["logoff"] = ev
+                if lid in self._SKIP_IDS:
+                    continue
+                sess = _latest_session(computer, lid) or _new_session(computer, lid)
+                sess["procs"].append(ev)
+                _touch_session(sess, ev)
+                continue
+
+            if eid == 4634:
+                lid = str(ed.get("TargetLogonId", "")).strip()
+                if lid in self._SKIP_IDS:
+                    continue
+                sess = _latest_session(computer, lid)
+                if sess is None or sess.get("logoff") is not None:
+                    sess = _new_session(computer, lid)
+                sess["logoff"] = ev
+                _touch_session(sess, ev)
 
         result: list[dict] = []
-        for (computer, lid), sess in raw.items():
-            logon_ev  = sess.get("logon")
-            logoff_ev = sess.get("logoff")
+        for (computer, lid), sessions in raw.items():
+            for idx, sess in enumerate(sessions):
+                logon_ev  = sess.get("logon")
+                logoff_ev = sess.get("logoff")
 
-            if logon_ev:
-                ed         = logon_ev.get("event_data", {}) or {}
-                user       = ed.get("TargetUserName") or ed.get("SubjectUserName") or ""
-                logon_type = str(ed.get("LogonType", "")).strip()
-                start_ts   = logon_ev.get("timestamp", "")
-            else:
-                user = logon_type = start_ts = ""
-            # computer comes from the (computer, lid) dict key — always present
-            # regardless of whether a 4624 logon event was seen for this session.
+                if logon_ev:
+                    ed         = logon_ev.get("event_data", {}) or {}
+                    user       = ed.get("TargetUserName") or ed.get("SubjectUserName") or ""
+                    logon_type = str(ed.get("LogonType", "")).strip()
+                    start_ts   = str(logon_ev.get("timestamp", "") or "")
+                else:
+                    user = logon_type = start_ts = ""
 
-            end_ts   = logoff_ev.get("timestamp", "") if logoff_ev else ""
-            if start_ts and end_ts:
-                dur_str = self._calc_duration(start_ts, end_ts)
-                # RDP/RemoteInteractive sessions can have disconnect gaps where
-                # the session persists but is idle.  Without 4778/4779 events
-                # we can only report wall-clock time, so flag it clearly.
-                if logon_type == "10":
-                    dur_str += " (wall clock)"
-                duration = dur_str
-            else:
-                duration = "Active" if start_ts else ""
+                scope_start_ts = _norm_ts(start_ts) or sess["first_seen_ts"]
 
-            has_dangerous = any(
-                any(dp in str((p.get("event_data") or {}).get("PrivilegeList", ""))
-                    for dp in self._DANGEROUS_PRIVS)
-                for p in sess.get("privs", [])
-            )
+                next_start_ts = ""
+                for next_sess in sessions[idx + 1:]:
+                    next_logon = next_sess.get("logon")
+                    if next_logon:
+                        next_start_ts = _norm_ts(next_logon.get("timestamp", ""))
+                        if next_start_ts:
+                            break
 
-            result.append({
-                "lid":              lid,
-                "user":             user,
-                "computer":         computer,
-                "logon_type":       logon_type,
-                "logon_type_label": self._TYPE_NAMES.get(logon_type, f"Type {logon_type}") if logon_type else "",
-                "initiation":       self._TYPE_INITIATION.get(logon_type, "") if logon_type else "",
-                "start_ts":         start_ts,
-                "end_ts":           end_ts,
-                "duration":         duration,
-                "proc_count":       len(sess.get("procs", [])),
-                "priv_count":       len(sess.get("privs", [])),
-                "has_dangerous":    has_dangerous,
-                "logon_ev":         logon_ev,
-            })
+                explicit_end_ts = str(logoff_ev.get("timestamp", "") or "") if logoff_ev else ""
+                explicit_end_norm = _norm_ts(explicit_end_ts)
+                candidate_end = explicit_end_norm
+                if sess["last_seen_ts"] and sess["last_seen_ts"] > candidate_end:
+                    candidate_end = sess["last_seen_ts"]
 
-        result.sort(key=lambda s: s["start_ts"])
+                if next_start_ts and (not candidate_end or candidate_end >= next_start_ts):
+                    scope_end_ts = next_start_ts
+                    scope_end_inclusive = False
+                else:
+                    scope_end_ts = candidate_end
+                    scope_end_inclusive = bool(scope_end_ts)
+
+                if scope_start_ts and scope_end_ts:
+                    dur_str = self._calc_duration(scope_start_ts, scope_end_ts)
+                    # RDP/RemoteInteractive sessions can have disconnect gaps where
+                    # the session persists but is idle.  Without 4778/4779 events
+                    # we can only report wall-clock time, so flag it clearly.
+                    if logon_type == "10":
+                        dur_str += " (wall clock)"
+                    duration = dur_str
+                else:
+                    duration = "Active" if scope_start_ts else ""
+
+                has_dangerous = any(
+                    any(dp in str((p.get("event_data") or {}).get("PrivilegeList", ""))
+                        for dp in self._DANGEROUS_PRIVS)
+                    for p in sess.get("privs", [])
+                )
+
+                result.append({
+                    "session_key":         sess["session_key"],
+                    "lid":                 lid,
+                    "user":                user,
+                    "computer":            computer,
+                    "logon_type":          logon_type,
+                    "logon_type_label":    self._TYPE_NAMES.get(logon_type, f"Type {logon_type}") if logon_type else "",
+                    "initiation":          self._TYPE_INITIATION.get(logon_type, "") if logon_type else "",
+                    "start_ts":            start_ts,
+                    "end_ts":              scope_end_ts,
+                    "scope_start_ts":      scope_start_ts,
+                    "scope_end_ts":        scope_end_ts,
+                    "scope_end_inclusive": scope_end_inclusive,
+                    "duration":            duration,
+                    "proc_count":          len(sess.get("procs", [])),
+                    "priv_count":          len(sess.get("privs", [])),
+                    "has_dangerous":       has_dangerous,
+                    "logon_ev":            logon_ev,
+                    "related_keys":        frozenset(sess["related_keys"]),
+                })
+
+        result.sort(key=lambda s: (s["scope_start_ts"], s["computer"], s["lid"]))
         return result
 
     @staticmethod
@@ -1226,7 +1312,7 @@ class _LogonSessionDialog(QDialog):
         # ── Summary ───────────────────────────────────────────────────────
         total     = len(self._all_sessions)
         with_4624 = sum(1 for s in self._all_sessions if s["logon_ev"])
-        active    = sum(1 for s in self._all_sessions if s["start_ts"] and not s["end_ts"])
+        active    = sum(1 for s in self._all_sessions if s["scope_start_ts"] and not s["scope_end_ts"])
         dangerous = sum(1 for s in self._all_sessions if s["has_dangerous"])
 
         danger_txt = (
@@ -1326,7 +1412,7 @@ class _LogonSessionDialog(QDialog):
             row_bg = None
             if s["has_dangerous"]:
                 row_bg = danger_color
-            elif not s["end_ts"]:
+            elif not s["scope_end_ts"]:
                 row_bg = active_color
 
             start_disp = s["start_ts"].replace("T", " ").rstrip("Z")[:19] if s["start_ts"] else ""
@@ -1354,8 +1440,9 @@ class _LogonSessionDialog(QDialog):
                     else Qt.AlignmentFlag.AlignLeft
                 )
                 item.setTextAlignment(align | Qt.AlignmentFlag.AlignVCenter)
-                # Store LogonId in UserRole for retrieval on click
-                item.setData(Qt.ItemDataRole.UserRole, (s["computer"], s["lid"]))
+                # Store the concrete session identity so reused LUIDs on the same
+                # host still resolve to the correct browser row.
+                item.setData(Qt.ItemDataRole.UserRole, s["session_key"])
                 if row_bg:
                     item.setBackground(row_bg)
                 if col == 10 and s["has_dangerous"]:   # ⚠ Dangerous column (shifted +1)
@@ -1389,10 +1476,9 @@ class _LogonSessionDialog(QDialog):
         if not item:
             return None
         key = item.data(Qt.ItemDataRole.UserRole)
-        if isinstance(key, tuple):
-            computer_key, lid = key
+        if isinstance(key, tuple) and len(key) == 3:
             for s in self._all_sessions:
-                if s["lid"] == lid and s["computer"] == computer_key:
+                if s.get("session_key") == key:
                     return s
         else:
             # Fallback for any cell whose UserRole was not set (shouldn't happen).
@@ -5459,31 +5545,46 @@ class MainWindow(QMainWindow):
                 self._update_count_label()
                 return
 
-            # Query ALL events from Parquet whose event_data references this logon_id,
-            # scoped to the originating host so same-LUID sessions from different
-            # machines in a multi-host load are not conflated.
+            # Query ALL events from Parquet whose event_data references this
+            # concrete session instance. Scope by host + time window so later
+            # same-host LogonId reuse does not leak into the selected session.
             _computer = (session_info or {}).get("computer", "")
+            _start_ts = (session_info or {}).get("scope_start_ts", "")
+            _end_ts = (session_info or {}).get("scope_end_ts", "")
+            _end_inclusive = bool((session_info or {}).get("scope_end_inclusive"))
             try:
-                _lid_esc  = logon_id.replace("'", "''")
-                _comp_esc = _computer.replace("'", "''")
-                _computer_clause = (
-                    f" AND computer = '{_comp_esc}'" if _computer else ""
-                )
                 _c = _duckdb.connect()
+                _where_parts = [
+                    "("
+                    "json_extract_string(event_data_json, '$.TargetLogonId') = ? "
+                    "OR json_extract_string(event_data_json, '$.SubjectLogonId') = ?"
+                    ")"
+                ]
+                _params: list[object] = [logon_id, logon_id]
+                if _computer:
+                    _where_parts.append("computer = ?")
+                    _params.append(_computer)
+                if _start_ts:
+                    _where_parts.append("timestamp_utc >= CAST(? AS TIMESTAMP)")
+                    _params.append(_start_ts)
+                if _end_ts:
+                    _where_parts.append(
+                        f"timestamp_utc {'<=' if _end_inclusive else '<'} CAST(? AS TIMESTAMP)"
+                    )
+                    _params.append(_end_ts)
                 _rid_rows = _c.execute(
                     f"SELECT source_file, record_id FROM parquet_scan({_shard_list_captured}) "
-                    f"WHERE (json_extract_string(event_data_json, '$.TargetLogonId') = '{_lid_esc}' "
-                    f"   OR  json_extract_string(event_data_json, '$.SubjectLogonId') = '{_lid_esc}')"
-                    f"{_computer_clause}"
+                    f"WHERE {' AND '.join(_where_parts)}",
+                    _params,
                 ).fetchall()
                 _c.close()
                 composite_keys = frozenset(
                     (r[0] or "", r[1]) for r in _rid_rows if r[1] is not None
                 )
             except Exception:
-                # Fallback: use only the pre-seeded composite keys from the 4 event types,
-                # scoped to the originating host so cross-host LUID reuse is not conflated.
-                composite_keys = frozenset(_lid_to_keys.get((_computer, logon_id), set()))
+                # Fallback: use the concrete session's related events from the
+                # browser reconstruction path when the DuckDB query fails.
+                composite_keys = frozenset((session_info or {}).get("related_keys", ()))
 
             if not composite_keys:
                 QMessageBox.information(self, "Logon Sessions",
@@ -5513,12 +5614,27 @@ class MainWindow(QMainWindow):
 
     def _set_session_filter(self, logon_id: str | None, session_info: dict | None) -> None:
         """Apply or clear the session LogonId filter on all proxy models."""
-        # Extract host scope so the filter doesn't match same-LUID sessions
-        # from different machines in multi-host loads.
+        # Extract host + time scope so the filter doesn't match same-LUID
+        # sessions from other hosts or later reuse on the same host.
         computer = (session_info or {}).get("computer", "") if logon_id else None
-        self._proxy_model.set_session_filter(logon_id, computer)
+        scope_start_ts = (session_info or {}).get("scope_start_ts") if logon_id else None
+        scope_end_ts = (session_info or {}).get("scope_end_ts") if logon_id else None
+        scope_end_inclusive = bool((session_info or {}).get("scope_end_inclusive")) if logon_id else False
+        self._proxy_model.set_session_filter(
+            logon_id,
+            computer,
+            scope_start_ts,
+            scope_end_ts,
+            scope_end_inclusive,
+        )
         for state in self._file_tabs.values():
-            state.proxy.set_session_filter(logon_id, computer)
+            state.proxy.set_session_filter(
+                logon_id,
+                computer,
+                scope_start_ts,
+                scope_end_ts,
+                scope_end_inclusive,
+            )
         self._update_session_filter_badge(logon_id, session_info)
         self._update_count_label()
 
@@ -6853,10 +6969,19 @@ class MainWindow(QMainWindow):
 
         # Propagate any active session filter to this new proxy
         if self._proxy_model.has_session_filter():
-            lid      = self._proxy_model.get_session_filter()
-            computer = self._proxy_model.get_session_filter_computer()
+            lid            = self._proxy_model.get_session_filter()
+            computer       = self._proxy_model.get_session_filter_computer()
+            scope_start_ts = self._proxy_model.get_session_filter_start_ts()
+            scope_end_ts   = self._proxy_model.get_session_filter_end_ts()
+            scope_end_incl = self._proxy_model.get_session_filter_end_inclusive()
             if lid:
-                proxy.set_session_filter(lid, computer)
+                proxy.set_session_filter(
+                    lid,
+                    computer,
+                    scope_start_ts,
+                    scope_end_ts,
+                    scope_end_incl,
+                )
 
         # ── Tab bar: must be visible so user can navigate between tabs ────────
         # In merged mode the bar is collapsed to save space; un-collapse it now.

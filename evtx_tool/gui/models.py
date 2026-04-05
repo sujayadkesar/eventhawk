@@ -508,9 +508,16 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         # When set, only events whose event_data contains a matching
         # TargetLogonId or SubjectLogonId are shown.  _session_computer scopes
         # the filter to a single host so that different machines with the same
-        # LUID value are not conflated in multi-host loads.
+        # LUID value are not conflated in multi-host loads.  The optional time
+        # bounds prevent same-host LogonId reuse later in the dataset from
+        # leaking into the selected session view.
         self._session_logon_id: str | None = None
         self._session_computer: str | None = None
+        self._session_start_ts: str | None = None
+        self._session_end_ts: str | None = None
+        self._session_end_inclusive: bool = False
+        self._session_start_dt: object | None = None
+        self._session_end_dt: object | None = None
 
         # IOC pivot / session / missing-record-ID pivot: filter by int record_id.
         self._record_id_filter: frozenset | None = None
@@ -580,6 +587,11 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         self._bookmark_key_filter = None
         self._session_logon_id   = None
         self._session_computer   = None
+        self._session_start_ts   = None
+        self._session_end_ts     = None
+        self._session_end_inclusive = False
+        self._session_start_dt   = None
+        self._session_end_dt     = None
         self._quick_filters      = []
         self._quick_excludes     = {}
         self._quick_includes     = {}
@@ -864,8 +876,14 @@ class EventFilterProxyModel(QSortFilterProxyModel):
 
     # ── Session LogonId filter (Layer 5) ──────────────────────────────────
 
-    def set_session_filter(self, logon_id: str | None,
-                            computer: str | None = None) -> None:
+    def set_session_filter(
+        self,
+        logon_id: str | None,
+        computer: str | None = None,
+        start_ts: str | None = None,
+        end_ts: str | None = None,
+        end_inclusive: bool = False,
+    ) -> None:
         """
         Show only events that belong to a specific logon session.
 
@@ -873,10 +891,21 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         SubjectLogonId equal to *logon_id*.  When *computer* is provided the
         filter is also scoped to that host, preventing false matches in
         multi-host loads where different machines can share the same LUID.
-        Pass None to clear.
+        Optional *start_ts* / *end_ts* bounds further scope the filter to the
+        concrete session instance so later LogonId reuse on the same host is
+        excluded. Pass None to clear.
         """
         self._session_logon_id = logon_id
         self._session_computer = computer if logon_id else None
+        self._session_start_ts = start_ts if logon_id and start_ts else None
+        self._session_end_ts = end_ts if logon_id and end_ts else None
+        self._session_end_inclusive = bool(logon_id and self._session_end_ts and end_inclusive)
+        self._session_start_dt = (
+            _filter_parse_ts(self._session_start_ts) if self._session_start_ts and _filter_parse_ts else None
+        )
+        self._session_end_dt = (
+            _filter_parse_ts(self._session_end_ts) if self._session_end_ts and _filter_parse_ts else None
+        )
         self._update_filter_active()
         self.invalidateFilter()
 
@@ -891,6 +920,18 @@ class EventFilterProxyModel(QSortFilterProxyModel):
     def get_session_filter_computer(self) -> str | None:
         """Return the active session computer scope, or None."""
         return self._session_computer
+
+    def get_session_filter_start_ts(self) -> str | None:
+        """Return the active session start boundary, or None."""
+        return self._session_start_ts
+
+    def get_session_filter_end_ts(self) -> str | None:
+        """Return the active session end boundary, or None."""
+        return self._session_end_ts
+
+    def get_session_filter_end_inclusive(self) -> bool:
+        """Return whether the active session end boundary is inclusive."""
+        return self._session_end_inclusive
 
     def clear_session_filter(self) -> None:
         """Remove the session filter."""
@@ -998,6 +1039,18 @@ class EventFilterProxyModel(QSortFilterProxyModel):
             subject_lid = str(ed.get("SubjectLogonId", "") or "").strip()
             if target_lid != self._session_logon_id and subject_lid != self._session_logon_id:
                 return False
+            if self._session_start_dt or self._session_end_dt:
+                event_ts = _filter_parse_ts(ev.get("timestamp")) if _filter_parse_ts else None
+                if event_ts is None:
+                    return False
+                if self._session_start_dt and event_ts < self._session_start_dt:
+                    return False
+                if self._session_end_dt:
+                    if self._session_end_inclusive:
+                        if event_ts > self._session_end_dt:
+                            return False
+                    elif event_ts >= self._session_end_dt:
+                        return False
 
         return True
 
