@@ -4664,6 +4664,9 @@ class MainWindow(QMainWindow):
         self._active_technique_filter = None
         self._tactic_filter_widget.setVisible(False)
         self._col_filters.clear()
+        # Clear session LogonId filter so an old filter from a previous load
+        # does not silently carry into the new dataset and suppress results.
+        self._set_session_filter(None, None)
 
         if self._view_mode == "separate" and events:
             # ── SEPARATE MODE: split by source_file → per-file tabs ──────
@@ -7324,6 +7327,10 @@ class MainWindow(QMainWindow):
             self._table.setModel(self._proxy_model)
             self._table.selectionModel().selectionChanged.connect(self._on_row_selected)
         self._cleanup_juggernaut()
+
+        # Clear normal-mode session filter so a stale LogonId does not carry
+        # over to a subsequent load.  JM session state is reset by cleanup above.
+        self._set_session_filter(None, None)
 
         self._events             = []
         self._logon_sessions_dlg = None   # invalidate session browser cache
