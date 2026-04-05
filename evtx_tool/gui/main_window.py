@@ -1140,6 +1140,7 @@ class _LogonSessionDialog(QDialog):
                 "related_keys":   set(),
                 "linked_lid_raw": "",   # TargetLinkedLogonId from 4624, resolved later
                 "linked_lid":     "",   # resolved sibling LogonId after post-pass
+                "linked_session_key": None,  # exact sibling session identity
             }
             sessions.append(sess)
             return sess
@@ -1231,8 +1232,11 @@ class _LogonSessionDialog(QDialog):
                     default=sibling_list[0],
                 )
                 sess["linked_lid"] = linked_raw
+                sess["linked_session_key"] = best.get("session_key")
                 if not best.get("linked_lid"):
                     best["linked_lid"] = lid
+                if not best.get("linked_session_key"):
+                    best["linked_session_key"] = sess.get("session_key")
 
         result: list[dict] = []
         for (computer, lid), sessions in raw.items():
@@ -1307,26 +1311,57 @@ class _LogonSessionDialog(QDialog):
                     "has_dangerous":       has_dangerous,
                     "logon_ev":            logon_ev,
                     "related_keys":        frozenset(sess["related_keys"]),
+                    "linked_related_keys": frozenset(sess["related_keys"]),
                     "linked_lid":          sess.get("linked_lid", ""),
+                    "linked_session_key":  sess.get("linked_session_key"),
                 })
 
         # Post-pass: compute union time window for linked sibling pairs so the
         # session filter can span both sessions without cutting off events from
-        # whichever sibling has the wider scope.
-        _by_cl: dict[tuple[str, str], dict] = {
-            (s["computer"], s["lid"]): s for s in result
+        # whichever sibling has the wider scope. Also carry the union of related
+        # record keys so the JM fallback path can include both siblings when the
+        # DuckDB query path is unavailable.
+        _by_key: dict[tuple[str, str, int], dict] = {
+            s["session_key"]: s for s in result
         }
         for _sd in result:
-            _lnk = _sd.get("linked_lid", "")
-            if not _lnk:
+            _lnk_key = _sd.get("linked_session_key")
+            if not _lnk_key:
                 continue
-            _sib = _by_cl.get((_sd["computer"], _lnk))
+            _sib = _by_key.get(_lnk_key)
             if not _sib:
                 continue
             _starts = [t for t in (_sd["scope_start_ts"], _sib["scope_start_ts"]) if t]
             _ends   = [t for t in (_sd["scope_end_ts"],   _sib["scope_end_ts"])   if t]
-            _sd["linked_scope_start_ts"] = min(_starts) if _starts else ""
-            _sd["linked_scope_end_ts"]   = max(_ends)   if _ends   else ""
+            _union_start = min(_starts) if _starts else ""
+            _union_end   = max(_ends)   if _ends   else ""
+            _sd_end = _sd.get("scope_end_ts") or ""
+            _sib_end = _sib.get("scope_end_ts") or ""
+            if _sd_end and _sib_end:
+                if _sib_end > _sd_end:
+                    _union_end_inclusive = bool(_sib.get("scope_end_inclusive"))
+                elif _sib_end < _sd_end:
+                    _union_end_inclusive = bool(_sd.get("scope_end_inclusive"))
+                else:
+                    _union_end_inclusive = (
+                        bool(_sd.get("scope_end_inclusive"))
+                        or bool(_sib.get("scope_end_inclusive"))
+                    )
+            elif _sd_end:
+                _union_end_inclusive = bool(_sd.get("scope_end_inclusive"))
+            elif _sib_end:
+                _union_end_inclusive = bool(_sib.get("scope_end_inclusive"))
+            else:
+                _union_end_inclusive = False
+            _sd["linked_scope_start_ts"] = _union_start
+            _sib["linked_scope_start_ts"] = _union_start
+            _sd["linked_scope_end_ts"]   = _union_end
+            _sib["linked_scope_end_ts"]   = _union_end
+            _sd["linked_scope_end_inclusive"] = _union_end_inclusive
+            _sib["linked_scope_end_inclusive"] = _union_end_inclusive
+            _union_keys = frozenset(set(_sd["related_keys"]) | set(_sib["related_keys"]))
+            _sd["linked_related_keys"] = _union_keys
+            _sib["linked_related_keys"] = _union_keys
 
         result.sort(key=lambda s: (s["scope_start_ts"], s["computer"], s["lid"]))
         return result
@@ -5677,11 +5712,15 @@ class MainWindow(QMainWindow):
                 # Widen to union of both sibling windows.
                 _ls = (session_info or {}).get("linked_scope_start_ts") or ""
                 _le = (session_info or {}).get("linked_scope_end_ts") or ""
+                _lei = bool((session_info or {}).get("linked_scope_end_inclusive"))
                 if _ls and (not _start_ts or _ls < _start_ts):
                     _start_ts = _ls
-                if _le and (not _end_ts or _le > _end_ts):
-                    _end_ts = _le
-                    _end_inclusive = True
+                if _le:
+                    if not _end_ts or _le > _end_ts:
+                        _end_ts = _le
+                        _end_inclusive = _lei
+                    elif _le == _end_ts:
+                        _end_inclusive = _end_inclusive or _lei
             try:
                 _c = _duckdb.connect()
                 if _linked_lid:
@@ -5722,9 +5761,13 @@ class MainWindow(QMainWindow):
                     (r[0] or "", r[1]) for r in _rid_rows if r[1] is not None
                 )
             except Exception:
-                # Fallback: use the concrete session's related events from the
-                # browser reconstruction path when the DuckDB query fails.
-                composite_keys = frozenset((session_info or {}).get("related_keys", ()))
+                # Fallback: use the concrete session's precomputed related
+                # keys; linked sibling pairs carry a union of both sessions'
+                # keys so the fallback stays consistent with the main query.
+                composite_keys = frozenset(
+                    (session_info or {}).get("linked_related_keys")
+                    or (session_info or {}).get("related_keys", ())
+                )
 
             if not composite_keys:
                 QMessageBox.information(self, "Logon Sessions",
@@ -5766,11 +5809,15 @@ class MainWindow(QMainWindow):
             # the linked session that fall outside the primary window are kept.
             _ls = (session_info or {}).get("linked_scope_start_ts") or ""
             _le = (session_info or {}).get("linked_scope_end_ts") or ""
+            _lei = bool((session_info or {}).get("linked_scope_end_inclusive"))
             if _ls and (not scope_start_ts or _ls < scope_start_ts):
                 scope_start_ts = _ls
-            if _le and (not scope_end_ts or _le > scope_end_ts):
-                scope_end_ts = _le
-                scope_end_inclusive = True
+            if _le:
+                if not scope_end_ts or _le > scope_end_ts:
+                    scope_end_ts = _le
+                    scope_end_inclusive = _lei
+                elif _le == scope_end_ts:
+                    scope_end_inclusive = scope_end_inclusive or _lei
         self._proxy_model.set_session_filter(
             logon_id, computer, scope_start_ts, scope_end_ts, scope_end_inclusive,
         )
