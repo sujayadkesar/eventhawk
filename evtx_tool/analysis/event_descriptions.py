@@ -77,7 +77,7 @@ def _is_rdp_remote(ev: dict) -> bool:
 
 # ── Logon type tables ─────────────────────────────────────────────────────
 
-_LOGON_TYPE_LABEL: dict[str, str] = {
+LOGON_TYPE_LABEL: dict[str, str] = {
     "2":  "Interactive",
     "3":  "Network",
     "4":  "Batch",
@@ -869,7 +869,7 @@ def get_event_description(ev: dict) -> str | None:
     # ── 4624 — Successful Logon ───────────────────────────────────────────
     if eid == 4624:
         lt = _f(ed, "LogonType")
-        label = _LOGON_TYPE_LABEL.get(lt, f"Type {lt}" if lt else "Unknown type")
+        label = LOGON_TYPE_LABEL.get(lt, f"Type {lt}" if lt else "Unknown type")
         body  = _LOGON_TYPE_DESC.get(lt,
                     "A user or service successfully authenticated on this system.")
         user = _f(ed, "TargetUserName")
@@ -884,7 +884,7 @@ def get_event_description(ev: dict) -> str | None:
     # ── 4625 — Failed Logon ───────────────────────────────────────────────
     if eid == 4625:
         lt     = _f(ed, "LogonType")
-        label  = _LOGON_TYPE_LABEL.get(lt, f"Type {lt}" if lt else "")
+        label  = LOGON_TYPE_LABEL.get(lt, f"Type {lt}" if lt else "")
         user   = _f(ed, "TargetUserName")
         ip     = _f(ed, "IpAddress")
         sub    = _f(ed, "SubStatus").lower()
@@ -1184,7 +1184,7 @@ def get_event_description(ev: dict) -> str | None:
         if user:
             desc = f"'{user}' logged off."
         if ltype:
-            label = _LOGON_TYPE_LABEL.get(ltype, ltype)
+            label = LOGON_TYPE_LABEL.get(ltype, ltype)
             desc += f"  Logon type: {label}."
         return desc
 

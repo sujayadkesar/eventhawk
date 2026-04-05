@@ -974,12 +974,14 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         # ── Layer 5: Session LogonId filter ──────────────────────────────────
         if self._session_logon_id:
             ed = ev.get("event_data", {}) or {}
-            # Different event types store the LogonId under different field names
-            lid = (
-                str(ed.get("TargetLogonId",  "") or "").strip() or
-                str(ed.get("SubjectLogonId", "") or "").strip()
-            )
-            if lid != self._session_logon_id:
+            # Check both fields independently — an event belongs to the session
+            # if EITHER TargetLogonId OR SubjectLogonId matches.  Using an OR
+            # fallback (take first non-empty) would silently drop events where
+            # TargetLogonId is set to a different session's ID while
+            # SubjectLogonId correctly references this session.
+            target_lid  = str(ed.get("TargetLogonId",  "") or "").strip()
+            subject_lid = str(ed.get("SubjectLogonId", "") or "").strip()
+            if target_lid != self._session_logon_id and subject_lid != self._session_logon_id:
                 return False
 
         return True

@@ -30,6 +30,8 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from functools import lru_cache
 
+from .event_descriptions import LOGON_TYPE_LABEL as _LOGON_TYPE_LABEL
+
 logger = logging.getLogger(__name__)
 
 # ── Timestamp parser (cached) ────────────────────────────────────────────────
@@ -1112,12 +1114,7 @@ def _rule_logonid_privesc(idx: _EventIndex, session_idx: _LogonSessionIndex) -> 
 
         computer    = logon_ev.get("computer", "")
         logon_type  = _get_logon_type(logon_ev)
-        _type_names = {
-            "2": "Interactive", "3": "Network", "4": "Batch", "5": "Service",
-            "7": "Unlock", "8": "NetworkCleartext", "9": "NewCredentials",
-            "10": "RemoteInteractive(RDP)", "11": "CachedInteractive",
-        }
-        type_label  = _type_names.get(logon_type, f"Type{logon_type}") if logon_type else "Unknown"
+        type_label = _LOGON_TYPE_LABEL.get(logon_type, f"Type {logon_type}") if logon_type else "Unknown"
 
         found_privs: set[str] = set()
         for p in dangerous:
@@ -1267,12 +1264,8 @@ def _rule_multi_host_lateral_movement(idx: _EventIndex, session_idx: _LogonSessi
 
             if len(distinct_computers) >= _MIN_HOSTS:
                 sorted_hosts  = sorted(distinct_computers)
-                logon_type_labels = {
-                    "3": "Network(3)", "8": "NetCleartext(8)",
-                    "9": "NewCreds(9)", "10": "RDP(10)",
-                }
                 seen_types = sorted({
-                    logon_type_labels.get(_get_logon_type(ev), f"Type{_get_logon_type(ev)}")
+                    _LOGON_TYPE_LABEL.get(_get_logon_type(ev), f"Type {_get_logon_type(ev)}")
                     for ev in window
                 })
                 chains.append(_chain(

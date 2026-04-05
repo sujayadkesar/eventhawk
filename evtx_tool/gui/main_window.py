@@ -1108,10 +1108,16 @@ class _LogonSessionDialog(QDialog):
                 user = computer = logon_type = start_ts = ""
 
             end_ts   = logoff_ev.get("timestamp", "") if logoff_ev else ""
-            duration = (
-                self._calc_duration(start_ts, end_ts) if (start_ts and end_ts)
-                else ("Active" if start_ts else "")
-            )
+            if start_ts and end_ts:
+                dur_str = self._calc_duration(start_ts, end_ts)
+                # RDP/RemoteInteractive sessions can have disconnect gaps where
+                # the session persists but is idle.  Without 4778/4779 events
+                # we can only report wall-clock time, so flag it clearly.
+                if logon_type == "10":
+                    dur_str += " (wall clock)"
+                duration = dur_str
+            else:
+                duration = "Active" if start_ts else ""
 
             has_dangerous = any(
                 any(dp in str((p.get("event_data") or {}).get("PrivilegeList", ""))
@@ -4628,6 +4634,7 @@ class MainWindow(QMainWindow):
         elapsed = time.monotonic() - self._parse_start_ts
 
         self._events         = events
+        self._logon_sessions_dlg = None   # invalidate session browser cache
         self._attack_summary = attack_summary
         self._iocs           = None
         self._chains         = []
@@ -5237,11 +5244,24 @@ class MainWindow(QMainWindow):
         if not events:
             QMessageBox.information(self, "Logon Sessions", "No events loaded.")
             return
+        # Reuse the existing dialog if it is still alive — avoids rebuilding
+        # sessions (O(n) scan) every time the user reopens the browser.
+        # The cache is invalidated whenever new events are loaded or cleared.
+        existing = getattr(self, "_logon_sessions_dlg", None)
+        if existing is not None:
+            try:
+                existing.show()
+                existing.raise_()
+                existing.activateWindow()
+                return
+            except RuntimeError:
+                pass  # underlying C++ object was destroyed
         dlg = _LogonSessionDialog(
             events=events,
             on_filter_fn=self._set_session_filter,
             parent=self,
         )
+        self._logon_sessions_dlg = dlg
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -7263,10 +7283,11 @@ class MainWindow(QMainWindow):
             self._table.selectionModel().selectionChanged.connect(self._on_row_selected)
         self._cleanup_juggernaut()
 
-        self._events         = []
-        self._attack_summary = None
-        self._iocs           = None
-        self._chains         = []
+        self._events             = []
+        self._logon_sessions_dlg = None   # invalidate session browser cache
+        self._attack_summary     = None
+        self._iocs               = None
+        self._chains             = []
 
         # ── Per-file state cleanup ────────────────────────────────────────
         # Close and destroy all open file tabs
