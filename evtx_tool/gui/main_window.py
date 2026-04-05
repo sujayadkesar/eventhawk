@@ -4122,6 +4122,9 @@ class MainWindow(QMainWindow):
             except Exception:
                 pass
         self._jm_file_models = []
+        # Reset session-filter state so stale keys are not reapplied to tabs
+        # opened in a subsequent JM load.
+        self._active_jm_session_keys = frozenset()
         if self._hw_con is not None:
             try:
                 self._hw_con.close()
@@ -5027,6 +5030,10 @@ class MainWindow(QMainWindow):
             self._hw_model._record_id_where_sql  = ""
             self._hw_model._record_id_params     = []
             self._hw_model._invalidate()
+            # Also clear record-id/bookmark filters on open per-file JM tab models.
+            for _fm in getattr(self, "_jm_file_models", []):
+                _fm.clear_record_id_filter()
+            self._active_jm_session_keys = frozenset()
         else:
             # Batch: clear all filter layers in one invalidateFilter() call.
             self._active_proxy.clear_all_filters()
@@ -5047,8 +5054,8 @@ class MainWindow(QMainWindow):
                     _st.model.clear_filter()
                     _st.model.clear_quick_filters()
 
-        # 5. Session filter — JM: already cleared in step 3
-        #    Normal mode: already cleared by clear_all_filters() above
+        # 5. Session filter — JM: cleared above (step 3 resets _hw_model + per-file models
+        #    + _active_jm_session_keys).  Normal mode: cleared by clear_all_filters() above.
 
         # 6. ATT&CK tactic filter — always clear (badge could carry over from normal mode)
         self._active_tactic_filter    = None
