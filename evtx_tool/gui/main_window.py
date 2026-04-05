@@ -1006,6 +1006,38 @@ class EventTimeZoneDialog(QDialog):
         return total * self._custom_sign
 
 
+# ── Custom QTableWidgetItem subclasses for correct column sorting ─────────────
+
+class _DurationItem(QTableWidgetItem):
+    """Sort by total seconds so '2h 05m 30s' > '5m 10s' > '30s' > 'Active' > '?'."""
+
+    @staticmethod
+    def _secs(text: str) -> int:
+        if not text or text in ("?", "Active", "(wall clock)"):
+            return -1
+        import re as _re
+        total = 0
+        for n, unit in _re.findall(r"(\d+)\s*([hms])", text):
+            n = int(n)
+            if unit == "h":   total += n * 3600
+            elif unit == "m": total += n * 60
+            else:             total += n
+        return total
+
+    def __lt__(self, other: "QTableWidgetItem") -> bool:
+        return self._secs(self.text()) < self._secs(other.text())
+
+
+class _IntItem(QTableWidgetItem):
+    """Sort integer-valued cells numerically instead of lexicographically."""
+
+    def __lt__(self, other: "QTableWidgetItem") -> bool:
+        try:
+            return int(self.text()) < int(other.text())
+        except ValueError:
+            return self.text() < other.text()
+
+
 # ── Logon Session Browser dialog ──────────────────────────────────────────────
 
 class _LogonSessionDialog(QDialog):
@@ -1438,7 +1470,12 @@ class _LogonSessionDialog(QDialog):
             right_align_cols = {8, 9}   # Procs, Priv Events (shifted +1 by new column)
 
             for col, text in enumerate(cells):
-                item = QTableWidgetItem(text)
+                if col == 7:          # Duration — sort by total seconds
+                    item = _DurationItem(text)
+                elif col in (8, 9):   # Procs, Priv Events — sort numerically
+                    item = _IntItem(text)
+                else:
+                    item = QTableWidgetItem(text)
                 align = (
                     Qt.AlignmentFlag.AlignRight if col in right_align_cols
                     else Qt.AlignmentFlag.AlignLeft
