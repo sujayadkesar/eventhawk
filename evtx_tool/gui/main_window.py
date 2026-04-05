@@ -1079,8 +1079,8 @@ class _LogonSessionDialog(QDialog):
         "8":  "Network logon with plaintext credentials (IIS Basic Auth, etc.)",
         "9":  "RunAs /netonly — local identity kept, network uses new creds",
         "10": "Remote Desktop (RDP) / Remote Assistance session",
-        "11": "Cached domain credentials used (DC unreachable)",
-        "12": "Cached RDP credentials used (DC unreachable)",
+        "11": "Cached credentials used (DC unreachable, local, or Microsoft account)",
+        "12": "Cached RDP credentials used (DC unreachable or Microsoft account)",
         "13": "Workstation unlock using cached credentials",
     }
 
@@ -1367,15 +1367,24 @@ class _LogonSessionDialog(QDialog):
         lbl_summary.setStyleSheet("padding: 4px 0; font-size: 9pt; background:transparent;")
         root.addWidget(lbl_summary)
 
-        # ── Search bar ────────────────────────────────────────────────────
+        # ── Search bar + display toggles ──────────────────────────────────
         search_row = QHBoxLayout()
         search_row.addWidget(QLabel("Search:"))
         self._search_edit = QLineEdit()
         self._search_edit.setPlaceholderText(
             "Filter by user, computer, session ID, or logon type…"
         )
-        self._search_edit.textChanged.connect(self._on_search)
+        self._search_edit.textChanged.connect(self._apply_display_filters)
         search_row.addWidget(self._search_edit, stretch=1)
+
+        self._chk_hide_service = QCheckBox("Hide service sessions (Type 5)")
+        self._chk_hide_service.setChecked(True)
+        self._chk_hide_service.setToolTip(
+            "Service-account logons (Type 5) are usually same-second noise. "
+            "Uncheck to include them."
+        )
+        self._chk_hide_service.toggled.connect(self._apply_display_filters)
+        search_row.addWidget(self._chk_hide_service)
         root.addLayout(search_row)
 
         # ── Table ─────────────────────────────────────────────────────────
@@ -1495,19 +1504,23 @@ class _LogonSessionDialog(QDialog):
 
     # ── Interaction ───────────────────────────────────────────────────────
 
-    def _on_search(self, text: str) -> None:
-        t = text.strip().lower()
-        if not t:
-            self._populate_table(self._all_sessions)
-            return
-        filtered = [
-            s for s in self._all_sessions
-            if t in s["user"].lower()
-            or t in s["computer"].lower()
-            or t in s["lid"].lower()
-            or t in s["logon_type_label"].lower()
-        ]
-        self._populate_table(filtered)
+    def _apply_display_filters(self, *_) -> None:
+        """Re-filter the session table applying both the search bar and the
+        'Hide service sessions' checkbox."""
+        hide_service = self._chk_hide_service.isChecked()
+        t = self._search_edit.text().strip().lower()
+        sessions = self._all_sessions
+        if hide_service:
+            sessions = [s for s in sessions if s["logon_type"] != "5"]
+        if t:
+            sessions = [
+                s for s in sessions
+                if t in s["user"].lower()
+                or t in s["computer"].lower()
+                or t in s["lid"].lower()
+                or t in s["logon_type_label"].lower()
+            ]
+        self._populate_table(sessions)
 
     def _selected_session(self) -> dict | None:
         row = self._tbl.currentRow()

@@ -110,8 +110,8 @@ _LOGON_TYPE_DESC: dict[str, str] = {
           "local context is unchanged.",
     "10": "Generated when a user establishes a Remote Desktop (RDP) or "
           "Terminal Services session from a remote machine.",
-    "11": "Generated when a user logs on using cached domain credentials "
-          "because the domain controller is unreachable.",
+    "11": "Generated when a user logs on using cached credentials — domain "
+          "controller unreachable, local account, or Microsoft account sign-in.",
     "12": "Generated when a user connects remotely using cached credentials.",
     "13": "Generated when cached credentials are used to unlock a workstation.",
 }
