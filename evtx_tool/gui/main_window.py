@@ -1067,49 +1067,56 @@ class _LogonSessionDialog(QDialog):
     # ── Session building ───────────────────────────────────────────────────
 
     def _build_sessions(self, events: list[dict]) -> list[dict]:
-        """Scan events and build one session record per unique LogonId."""
-        raw: dict[str, dict] = {}
+        """Scan events and build one session record per unique (computer, LogonId) pair.
+
+        Keying by (computer, lid) rather than bare lid prevents events from
+        different hosts that happen to share the same LUID from being merged
+        into a single session row in multi-host EVTX loads.
+        """
+        raw: dict[tuple[str, str], dict] = {}
         for ev in events:
-            eid = ev.get("event_id", 0)
-            ed  = ev.get("event_data", {}) or {}
+            eid      = ev.get("event_id", 0)
+            ed       = ev.get("event_data", {}) or {}
+            computer = ev.get("computer", "")
             if eid == 4624:
                 lid = str(ed.get("TargetLogonId",  "")).strip()
                 if lid not in self._SKIP_IDS:
                     raw.setdefault(
-                        lid, {"logon": None, "privs": [], "procs": [], "logoff": None}
+                        (computer, lid), {"logon": None, "privs": [], "procs": [], "logoff": None}
                     )["logon"] = ev
             elif eid == 4672:
                 lid = str(ed.get("SubjectLogonId", "")).strip()
                 if lid not in self._SKIP_IDS:
                     raw.setdefault(
-                        lid, {"logon": None, "privs": [], "procs": [], "logoff": None}
+                        (computer, lid), {"logon": None, "privs": [], "procs": [], "logoff": None}
                     )["privs"].append(ev)
             elif eid == 4688:
                 lid = str(ed.get("SubjectLogonId", "")).strip()
                 if lid not in self._SKIP_IDS:
                     raw.setdefault(
-                        lid, {"logon": None, "privs": [], "procs": [], "logoff": None}
+                        (computer, lid), {"logon": None, "privs": [], "procs": [], "logoff": None}
                     )["procs"].append(ev)
             elif eid == 4634:
                 lid = str(ed.get("TargetLogonId",  "")).strip()
                 if lid not in self._SKIP_IDS:
                     raw.setdefault(
-                        lid, {"logon": None, "privs": [], "procs": [], "logoff": None}
+                        (computer, lid), {"logon": None, "privs": [], "procs": [], "logoff": None}
                     )["logoff"] = ev
 
         result: list[dict] = []
-        for lid, sess in raw.items():
+        for (computer, lid), sess in raw.items():
             logon_ev  = sess.get("logon")
             logoff_ev = sess.get("logoff")
 
             if logon_ev:
                 ed         = logon_ev.get("event_data", {}) or {}
                 user       = ed.get("TargetUserName") or ed.get("SubjectUserName") or ""
-                computer   = logon_ev.get("computer", "")
                 logon_type = str(ed.get("LogonType", "")).strip()
                 start_ts   = logon_ev.get("timestamp", "")
             else:
-                user = computer = logon_type = start_ts = ""
+                user = logon_type = start_ts = ""
+            # computer comes from the (computer, lid) dict key — always present
+            # regardless of whether a 4624 logon event was seen for this session.
 
             end_ts   = logoff_ev.get("timestamp", "") if logoff_ev else ""
             if start_ts and end_ts:
@@ -1404,6 +1411,12 @@ class _LogonSessionDialog(QDialog):
 
     def _on_clear_filter(self) -> None:
         self._on_filter_fn(None, None)
+        self._filter_badge.setVisible(False)
+
+    def notify_filter_cleared(self) -> None:
+        """Called by the main window when the session filter is cleared externally
+        (e.g. via the 'Clear Session Filter' or 'Clear All Filters' button) so the
+        dialog's own badge stays in sync."""
         self._filter_badge.setVisible(False)
 
     def _on_context_menu(self, pos) -> None:
@@ -3456,10 +3469,10 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(0, self._refresh_attack_tab)
 
         # Invalidate the logon-session browser cache when the active tab changes
-        # in normal mode.  The dialog was built from self._active_events, which
-        # now refers to a different dataset, so the cached dialog is stale.
+        # in normal mode.  Close the existing dialog so it can no longer apply
+        # stale session filters against the newly active dataset.
         if self._hw_model is None:
-            self._logon_sessions_dlg = None
+            self._close_logon_sessions_dlg()
 
     def _remove_loaded_file(self, filepath: str) -> None:
         """Remove a file completely — close tab + free memory."""
@@ -4653,7 +4666,7 @@ class MainWindow(QMainWindow):
         elapsed = time.monotonic() - self._parse_start_ts
 
         self._events         = events
-        self._logon_sessions_dlg = None   # invalidate session browser cache
+        self._close_logon_sessions_dlg()   # close + invalidate session browser cache
         self._attack_summary = attack_summary
         self._iocs           = None
         self._chains         = []
@@ -5074,6 +5087,13 @@ class MainWindow(QMainWindow):
         self._update_quick_filter_badge()
         self._update_session_filter_badge(None, None)
         self._update_count_label()
+        # Sync the open session browser's internal badge if it is still showing.
+        _dlg = getattr(self, "_logon_sessions_dlg", None)
+        if _dlg is not None:
+            try:
+                _dlg.notify_filter_cleared()
+            except RuntimeError:
+                pass
 
     def _update_adv_filter_badge(self) -> None:
         """Show/hide the 'Filter Active' badge."""
@@ -5261,6 +5281,20 @@ class MainWindow(QMainWindow):
 
     # ── Session filter ─────────────────────────────────────────────────────
 
+    def _close_logon_sessions_dlg(self) -> None:
+        """Close an open session browser dialog and clear the cached reference.
+
+        Closing (not just nulling the pointer) prevents a stale dialog from
+        applying old session filters against a new or different dataset.
+        """
+        dlg = getattr(self, "_logon_sessions_dlg", None)
+        if dlg is not None:
+            try:
+                dlg.close()
+            except RuntimeError:
+                pass  # underlying C++ object already destroyed
+        self._logon_sessions_dlg = None
+
     def _on_show_logon_sessions(self) -> None:
         """Open the Logon Session Browser dialog (non-modal)."""
         if self._hw_model is not None:
@@ -5417,16 +5451,22 @@ class MainWindow(QMainWindow):
                 self._update_count_label()
                 return
 
-            # Query ALL events from Parquet whose event_data references this logon_id.
-            # Select source_file too so we build composite (source_file, record_id) keys —
-            # record_id alone is not unique across multi-file loads.
+            # Query ALL events from Parquet whose event_data references this logon_id,
+            # scoped to the originating host so same-LUID sessions from different
+            # machines in a multi-host load are not conflated.
+            _computer = (session_info or {}).get("computer", "")
             try:
-                _lid_esc = logon_id.replace("'", "''")
+                _lid_esc  = logon_id.replace("'", "''")
+                _comp_esc = _computer.replace("'", "''")
+                _computer_clause = (
+                    f" AND computer = '{_comp_esc}'" if _computer else ""
+                )
                 _c = _duckdb.connect()
                 _rid_rows = _c.execute(
                     f"SELECT source_file, record_id FROM parquet_scan({_shard_list_captured}) "
-                    f"WHERE json_extract_string(event_data_json, '$.TargetLogonId') = '{_lid_esc}' "
-                    f"   OR json_extract_string(event_data_json, '$.SubjectLogonId') = '{_lid_esc}'"
+                    f"WHERE (json_extract_string(event_data_json, '$.TargetLogonId') = '{_lid_esc}' "
+                    f"   OR  json_extract_string(event_data_json, '$.SubjectLogonId') = '{_lid_esc}')"
+                    f"{_computer_clause}"
                 ).fetchall()
                 _c.close()
                 composite_keys = frozenset(
@@ -5461,11 +5501,12 @@ class MainWindow(QMainWindow):
 
     def _set_session_filter(self, logon_id: str | None, session_info: dict | None) -> None:
         """Apply or clear the session LogonId filter on all proxy models."""
-        # Apply to merged proxy
-        self._proxy_model.set_session_filter(logon_id)
-        # Apply to all separate-file tab proxies
+        # Extract host scope so the filter doesn't match same-LUID sessions
+        # from different machines in multi-host loads.
+        computer = (session_info or {}).get("computer", "") if logon_id else None
+        self._proxy_model.set_session_filter(logon_id, computer)
         for state in self._file_tabs.values():
-            state.proxy.set_session_filter(logon_id)
+            state.proxy.set_session_filter(logon_id, computer)
         self._update_session_filter_badge(logon_id, session_info)
         self._update_count_label()
 
@@ -5479,8 +5520,16 @@ class MainWindow(QMainWindow):
             self._active_jm_session_keys = frozenset()
             self._update_session_filter_badge(None, None)
             self._update_count_label()
-            return
-        self._set_session_filter(None, None)
+        else:
+            self._set_session_filter(None, None)
+        # Sync the dialog's internal badge so it doesn't claim a filter is
+        # active after it was cleared from outside the dialog.
+        _dlg = getattr(self, "_logon_sessions_dlg", None)
+        if _dlg is not None:
+            try:
+                _dlg.notify_filter_cleared()
+            except RuntimeError:
+                pass
 
     def _update_session_filter_badge(self, logon_id: str | None, session_info: dict | None) -> None:
         """Show or hide the session filter indicator bar."""
@@ -6792,9 +6841,10 @@ class MainWindow(QMainWindow):
 
         # Propagate any active session filter to this new proxy
         if self._proxy_model.has_session_filter():
-            lid = self._proxy_model.get_session_filter()
+            lid      = self._proxy_model.get_session_filter()
+            computer = self._proxy_model.get_session_filter_computer()
             if lid:
-                proxy.set_session_filter(lid)
+                proxy.set_session_filter(lid, computer)
 
         # ── Tab bar: must be visible so user can navigate between tabs ────────
         # In merged mode the bar is collapsed to save space; un-collapse it now.
@@ -7333,7 +7383,7 @@ class MainWindow(QMainWindow):
         self._set_session_filter(None, None)
 
         self._events             = []
-        self._logon_sessions_dlg = None   # invalidate session browser cache
+        self._close_logon_sessions_dlg()   # close + invalidate session browser cache
         self._attack_summary     = None
         self._iocs               = None
         self._chains             = []

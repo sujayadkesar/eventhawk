@@ -506,8 +506,11 @@ class EventFilterProxyModel(QSortFilterProxyModel):
 
         # ── Layer 5: Logon Session filter ──────────────────────────────────
         # When set, only events whose event_data contains a matching
-        # TargetLogonId or SubjectLogonId are shown.
+        # TargetLogonId or SubjectLogonId are shown.  _session_computer scopes
+        # the filter to a single host so that different machines with the same
+        # LUID value are not conflated in multi-host loads.
         self._session_logon_id: str | None = None
+        self._session_computer: str | None = None
 
         # IOC pivot / session / missing-record-ID pivot: filter by int record_id.
         self._record_id_filter: frozenset | None = None
@@ -576,6 +579,7 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         self._record_id_filter   = None
         self._bookmark_key_filter = None
         self._session_logon_id   = None
+        self._session_computer   = None
         self._quick_filters      = []
         self._quick_excludes     = {}
         self._quick_includes     = {}
@@ -860,14 +864,19 @@ class EventFilterProxyModel(QSortFilterProxyModel):
 
     # ── Session LogonId filter (Layer 5) ──────────────────────────────────
 
-    def set_session_filter(self, logon_id: str | None) -> None:
+    def set_session_filter(self, logon_id: str | None,
+                            computer: str | None = None) -> None:
         """
         Show only events that belong to a specific logon session.
 
         Matches events whose event_data contains a TargetLogonId or
-        SubjectLogonId equal to *logon_id*.  Pass None to clear.
+        SubjectLogonId equal to *logon_id*.  When *computer* is provided the
+        filter is also scoped to that host, preventing false matches in
+        multi-host loads where different machines can share the same LUID.
+        Pass None to clear.
         """
         self._session_logon_id = logon_id
+        self._session_computer = computer if logon_id else None
         self._update_filter_active()
         self.invalidateFilter()
 
@@ -878,6 +887,10 @@ class EventFilterProxyModel(QSortFilterProxyModel):
     def get_session_filter(self) -> str | None:
         """Return the active session LogonId, or None."""
         return self._session_logon_id
+
+    def get_session_filter_computer(self) -> str | None:
+        """Return the active session computer scope, or None."""
+        return self._session_computer
 
     def clear_session_filter(self) -> None:
         """Remove the session filter."""
@@ -973,12 +986,14 @@ class EventFilterProxyModel(QSortFilterProxyModel):
 
         # ── Layer 5: Session LogonId filter ──────────────────────────────────
         if self._session_logon_id:
+            # Scope to the originating host first (prevents false matches when
+            # different machines share the same LUID in a multi-host load).
+            if self._session_computer:
+                if ev.get("computer", "") != self._session_computer:
+                    return False
             ed = ev.get("event_data", {}) or {}
             # Check both fields independently — an event belongs to the session
-            # if EITHER TargetLogonId OR SubjectLogonId matches.  Using an OR
-            # fallback (take first non-empty) would silently drop events where
-            # TargetLogonId is set to a different session's ID while
-            # SubjectLogonId correctly references this session.
+            # if EITHER TargetLogonId OR SubjectLogonId matches.
             target_lid  = str(ed.get("TargetLogonId",  "") or "").strip()
             subject_lid = str(ed.get("SubjectLogonId", "") or "").strip()
             if target_lid != self._session_logon_id and subject_lid != self._session_logon_id:
