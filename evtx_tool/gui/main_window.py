@@ -1130,14 +1130,16 @@ class _LogonSessionDialog(QDialog):
         def _new_session(computer: str, lid: str) -> dict:
             sessions = raw.setdefault((computer, lid), [])
             sess = {
-                "session_key":   (computer, lid, len(sessions)),
-                "logon":         None,
-                "privs":         [],
-                "procs":         [],
-                "logoff":        None,
-                "first_seen_ts": "",
-                "last_seen_ts":  "",
-                "related_keys":  set(),
+                "session_key":    (computer, lid, len(sessions)),
+                "logon":          None,
+                "privs":          [],
+                "procs":          [],
+                "logoff":         None,
+                "first_seen_ts":  "",
+                "last_seen_ts":   "",
+                "related_keys":   set(),
+                "linked_lid_raw": "",   # TargetLinkedLogonId from 4624, resolved later
+                "linked_lid":     "",   # resolved sibling LogonId after post-pass
             }
             sessions.append(sess)
             return sess
@@ -1165,6 +1167,9 @@ class _LogonSessionDialog(QDialog):
                 sess = _new_session(computer, lid)
                 sess["logon"] = ev
                 _touch_session(sess, ev)
+                linked_raw = str(ed.get("TargetLinkedLogonId", "")).strip()
+                if linked_raw and linked_raw not in self._SKIP_IDS:
+                    sess["linked_lid_raw"] = linked_raw
                 continue
 
             if eid == 4672:
@@ -1194,6 +1199,33 @@ class _LogonSessionDialog(QDialog):
                     sess = _new_session(computer, lid)
                 sess["logoff"] = ev
                 _touch_session(sess, ev)
+
+        # ── Post-pass: resolve TargetLinkedLogonId sibling pairs ──────────
+        # Windows creates two sessions for elevated logons (split-token/UAC):
+        # a filtered-token session and an elevated-token session, each with a
+        # TargetLinkedLogonId pointing to the other.  Cross-link them so the
+        # browser can annotate and filter both together.
+        for (comp, lid), sess_list in raw.items():
+            for sess in sess_list:
+                linked_raw = sess.get("linked_lid_raw", "")
+                if not linked_raw or sess.get("linked_lid"):
+                    continue
+                sibling_list = raw.get((comp, linked_raw), [])
+                if not sibling_list:
+                    continue
+                # Match the sibling whose start time is closest to this session.
+                own_ts = sess.get("first_seen_ts", "")
+                best = min(
+                    sibling_list,
+                    key=lambda s: abs(
+                        (s.get("first_seen_ts", "") or "zzzz")
+                        .__gt__(own_ts) and 1 or -1
+                    ) if own_ts else 0,
+                    default=sibling_list[0],
+                )
+                sess["linked_lid"] = linked_raw
+                if not best.get("linked_lid"):
+                    best["linked_lid"] = lid
 
         result: list[dict] = []
         for (computer, lid), sessions in raw.items():
@@ -1268,6 +1300,7 @@ class _LogonSessionDialog(QDialog):
                     "has_dangerous":       has_dangerous,
                     "logon_ev":            logon_ev,
                     "related_keys":        frozenset(sess["related_keys"]),
+                    "linked_lid":          sess.get("linked_lid", ""),
                 })
 
         result.sort(key=lambda s: (s["scope_start_ts"], s["computer"], s["lid"]))
@@ -1477,6 +1510,12 @@ class _LogonSessionDialog(QDialog):
                 # Store the concrete session identity so reused LUIDs on the same
                 # host still resolve to the correct browser row.
                 item.setData(Qt.ItemDataRole.UserRole, s["session_key"])
+                # Annotate the Session ID cell with its split-token sibling, if any.
+                if col == 4 and s.get("linked_lid"):
+                    item.setToolTip(
+                        f"Split-token / UAC pair — linked session: {s['linked_lid']}\n"
+                        "Filtering will include events from both sessions."
+                    )
                 if row_bg:
                     item.setBackground(row_bg)
                 if col == 10 and s["has_dangerous"]:   # ⚠ Dangerous column (shifted +1)
@@ -5608,15 +5647,26 @@ class MainWindow(QMainWindow):
             _start_ts = (session_info or {}).get("scope_start_ts", "")
             _end_ts = (session_info or {}).get("scope_end_ts", "")
             _end_inclusive = bool((session_info or {}).get("scope_end_inclusive"))
+            _linked_lid = (session_info or {}).get("linked_lid", "") or ""
             try:
                 _c = _duckdb.connect()
-                _where_parts = [
-                    "("
-                    "json_extract_string(event_data_json, '$.TargetLogonId') = ? "
-                    "OR json_extract_string(event_data_json, '$.SubjectLogonId') = ?"
-                    ")"
-                ]
-                _params: list[object] = [logon_id, logon_id]
+                if _linked_lid:
+                    # Include events from the sibling split-token/UAC session too.
+                    _where_parts = [
+                        "("
+                        "json_extract_string(event_data_json, '$.TargetLogonId') IN (?, ?) "
+                        "OR json_extract_string(event_data_json, '$.SubjectLogonId') IN (?, ?)"
+                        ")"
+                    ]
+                    _params: list[object] = [logon_id, _linked_lid, logon_id, _linked_lid]
+                else:
+                    _where_parts = [
+                        "("
+                        "json_extract_string(event_data_json, '$.TargetLogonId') = ? "
+                        "OR json_extract_string(event_data_json, '$.SubjectLogonId') = ?"
+                        ")"
+                    ]
+                    _params: list[object] = [logon_id, logon_id]
                 if _computer:
                     _where_parts.append("computer = ?")
                     _params.append(_computer)
@@ -5676,21 +5726,16 @@ class MainWindow(QMainWindow):
         scope_start_ts = (session_info or {}).get("scope_start_ts") if logon_id else None
         scope_end_ts = (session_info or {}).get("scope_end_ts") if logon_id else None
         scope_end_inclusive = bool((session_info or {}).get("scope_end_inclusive")) if logon_id else False
+        linked_lid = (session_info or {}).get("linked_lid", "") or None if logon_id else None
         self._proxy_model.set_session_filter(
-            logon_id,
-            computer,
-            scope_start_ts,
-            scope_end_ts,
-            scope_end_inclusive,
+            logon_id, computer, scope_start_ts, scope_end_ts, scope_end_inclusive,
         )
+        self._proxy_model.set_session_linked_lid(linked_lid)
         for state in self._file_tabs.values():
             state.proxy.set_session_filter(
-                logon_id,
-                computer,
-                scope_start_ts,
-                scope_end_ts,
-                scope_end_inclusive,
+                logon_id, computer, scope_start_ts, scope_end_ts, scope_end_inclusive,
             )
+            state.proxy.set_session_linked_lid(linked_lid)
         self._update_session_filter_badge(logon_id, session_info)
         self._update_count_label()
 

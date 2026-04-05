@@ -513,6 +513,7 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         # leaking into the selected session view.
         self._session_logon_id: str | None = None
         self._session_computer: str | None = None
+        self._session_linked_lid: str | None = None   # sibling split-token session
         self._session_start_ts: str | None = None
         self._session_end_ts: str | None = None
         self._session_end_inclusive: bool = False
@@ -587,6 +588,7 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         self._bookmark_key_filter = None
         self._session_logon_id   = None
         self._session_computer   = None
+        self._session_linked_lid = None
         self._session_start_ts   = None
         self._session_end_ts     = None
         self._session_end_inclusive = False
@@ -897,6 +899,7 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         """
         self._session_logon_id = logon_id
         self._session_computer = computer if logon_id else None
+        self._session_linked_lid = None   # set via set_session_linked_lid()
         self._session_start_ts = start_ts if logon_id and start_ts else None
         self._session_end_ts = end_ts if logon_id and end_ts else None
         self._session_end_inclusive = bool(logon_id and self._session_end_ts and end_inclusive)
@@ -933,9 +936,18 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         """Return whether the active session end boundary is inclusive."""
         return self._session_end_inclusive
 
+    def set_session_linked_lid(self, linked_lid: str | None) -> None:
+        """Set the sibling split-token session's LogonId so its events are
+        included when the primary session filter is active."""
+        self._session_linked_lid = linked_lid or None
+        if self._session_logon_id:   # only re-filter if a session is active
+            self._update_filter_active()
+            self.invalidateFilter()
+
     def clear_session_filter(self) -> None:
         """Remove the session filter."""
         self.set_session_filter(None)
+        self._session_linked_lid = None
 
     # ── Sort override ─────────────────────────────────────────────────────
 
@@ -1037,7 +1049,15 @@ class EventFilterProxyModel(QSortFilterProxyModel):
             # if EITHER TargetLogonId OR SubjectLogonId matches.
             target_lid  = str(ed.get("TargetLogonId",  "") or "").strip()
             subject_lid = str(ed.get("SubjectLogonId", "") or "").strip()
-            if target_lid != self._session_logon_id and subject_lid != self._session_logon_id:
+            lids_match = (
+                target_lid == self._session_logon_id
+                or subject_lid == self._session_logon_id
+                or (self._session_linked_lid and (
+                    target_lid == self._session_linked_lid
+                    or subject_lid == self._session_linked_lid
+                ))
+            )
+            if not lids_match:
                 return False
             if self._session_start_dt or self._session_end_dt:
                 event_ts = _filter_parse_ts(ev.get("timestamp")) if _filter_parse_ts else None
