@@ -1101,7 +1101,7 @@ class _LogonSessionDialog(QDialog):
         self._all_sessions   = self._build_sessions(events)
         self._shown_sessions = list(self._all_sessions)
         self._build_ui()
-        self._populate_table(self._all_sessions)
+        self._apply_display_filters()   # honour default checkbox state on first render
 
     # ── Session building ───────────────────────────────────────────────────
 
@@ -1345,27 +1345,11 @@ class _LogonSessionDialog(QDialog):
         root.setContentsMargins(14, 12, 14, 10)
         root.setSpacing(8)
 
-        # ── Summary ───────────────────────────────────────────────────────
-        total     = len(self._all_sessions)
-        with_4624 = sum(1 for s in self._all_sessions if s["logon_ev"])
-        active    = sum(1 for s in self._all_sessions if s["scope_start_ts"] and not s["scope_end_ts"])
-        dangerous = sum(1 for s in self._all_sessions if s["has_dangerous"])
-
-        danger_txt = (
-            f"<span style='color:#a01800;font-weight:bold;'>⚠ {dangerous} with dangerous privileges</span>"
-            if dangerous else
-            "<span style='color:#2e6820;'>✓ No dangerous privileges detected</span>"
-        )
-        summary_html = (
-            f"<b>{total}</b> session(s) &nbsp;│&nbsp; "
-            f"<b>{with_4624}</b> with logon event &nbsp;│&nbsp; "
-            f"<b>{active}</b> active (no logoff recorded) &nbsp;│&nbsp; "
-            f"{danger_txt}"
-        )
-        lbl_summary = QLabel(summary_html)
-        lbl_summary.setTextFormat(Qt.TextFormat.RichText)
-        lbl_summary.setStyleSheet("padding: 4px 0; font-size: 9pt; background:transparent;")
-        root.addWidget(lbl_summary)
+        # ── Summary (populated by _apply_display_filters on first render) ──
+        self._lbl_summary = QLabel()
+        self._lbl_summary.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_summary.setStyleSheet("padding: 4px 0; font-size: 9pt; background:transparent;")
+        root.addWidget(self._lbl_summary)
 
         # ── Search bar + display toggles ──────────────────────────────────
         search_row = QHBoxLayout()
@@ -1506,7 +1490,7 @@ class _LogonSessionDialog(QDialog):
 
     def _apply_display_filters(self, *_) -> None:
         """Re-filter the session table applying both the search bar and the
-        'Hide service sessions' checkbox."""
+        'Hide service sessions' checkbox, then refresh the summary line."""
         hide_service = self._chk_hide_service.isChecked()
         t = self._search_edit.text().strip().lower()
         sessions = self._all_sessions
@@ -1521,6 +1505,24 @@ class _LogonSessionDialog(QDialog):
                 or t in s["logon_type_label"].lower()
             ]
         self._populate_table(sessions)
+        self._update_summary(sessions)
+
+    def _update_summary(self, sessions: list) -> None:
+        total     = len(sessions)
+        with_4624 = sum(1 for s in sessions if s["logon_ev"])
+        active    = sum(1 for s in sessions if s["scope_start_ts"] and not s["scope_end_ts"])
+        dangerous = sum(1 for s in sessions if s["has_dangerous"])
+        danger_txt = (
+            f"<span style='color:#a01800;font-weight:bold;'>⚠ {dangerous} with dangerous privileges</span>"
+            if dangerous else
+            "<span style='color:#2e6820;'>✓ No dangerous privileges detected</span>"
+        )
+        self._lbl_summary.setText(
+            f"<b>{total}</b> session(s) &nbsp;│&nbsp; "
+            f"<b>{with_4624}</b> with logon event &nbsp;│&nbsp; "
+            f"<b>{active}</b> active (no logoff recorded) &nbsp;│&nbsp; "
+            f"{danger_txt}"
+        )
 
     def _selected_session(self) -> dict | None:
         row = self._tbl.currentRow()
