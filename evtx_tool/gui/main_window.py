@@ -1244,9 +1244,13 @@ class _LogonSessionDialog(QDialog):
     @staticmethod
     def _calc_duration(start: str, end: str) -> str:
         try:
-            fmt     = "%Y-%m-%dT%H:%M:%S"
-            s_clean = start.rstrip("Z").split(".")[0][:19]
-            e_clean = end.rstrip("Z").split(".")[0][:19]
+            # Normalise both inputs to "YYYY-MM-DD HH:MM:SS" regardless of
+            # whether they arrived with a T separator, trailing Z, or microseconds.
+            def _norm(s: str) -> str:
+                return s.strip().rstrip("Z").replace("T", " ").split(".")[0][:19]
+            fmt     = "%Y-%m-%d %H:%M:%S"
+            s_clean = _norm(start)
+            e_clean = _norm(end)
             td      = datetime.strptime(e_clean, fmt) - datetime.strptime(s_clean, fmt)
             total   = int(abs(td.total_seconds()))
             h, rem  = divmod(total, 3600)
