@@ -22,8 +22,8 @@ echo [OK] Found: %PY_VER%
 echo %PY_VER% | findstr /r /c:"[0-9]t" >nul 2>&1
 if not errorlevel 1 (
     echo.
-    echo [ERROR] Free-threaded Python ^(e.g. 3.14t^) is not supported.
-    echo         Please install a standard Python 3.10-3.12 release from python.org
+    echo [ERROR] Free-threaded Python ^(e.g. 3.13t, 3.14t^) is not supported.
+    echo         Please install a standard Python 3.10+ release from python.org
     pause
     exit /b 1
 )
