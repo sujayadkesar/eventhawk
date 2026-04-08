@@ -19,7 +19,7 @@ for /f "tokens=*" %%i in ('py -3 --version 2^>^&1') do set PY_VER=%%i
 echo [OK] Found: %PY_VER%
 
 :: Reject free-threaded Python (3.14t, 3.13t, etc.) — not supported by evtx wheel
-echo %PY_VER% | findstr /i "t.exe t " >nul 2>&1
+echo %PY_VER% | findstr /r /c:"[0-9]t" >nul 2>&1
 if not errorlevel 1 (
     echo.
     echo [ERROR] Free-threaded Python ^(e.g. 3.14t^) is not supported.
