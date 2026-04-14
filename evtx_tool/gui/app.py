@@ -9,9 +9,55 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 import multiprocessing
 import os
 import sys
+import traceback
+from logging.handlers import RotatingFileHandler
+
+
+def _setup_gui_logging() -> None:
+    """Configure root logger for the GUI process.
+
+    Writes WARNING and above from every module to a rotating log file so
+    errors surfaced in the GUI are always persisted to disk.  The file is
+    kept small (5 MB × 3 backups = 15 MB max) so it never fills the disk.
+    """
+    log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                           "..", "..", "evtx_tool_logs")
+    os.makedirs(log_dir, exist_ok=True)
+    log_path = os.path.join(log_dir, "eventhawk_gui.log")
+
+    handler = RotatingFileHandler(
+        log_path,
+        maxBytes=5 * 1024 * 1024,   # 5 MB per file
+        backupCount=3,               # keep 3 rotated backups
+        encoding="utf-8",
+    )
+    handler.setLevel(logging.WARNING)
+    handler.setFormatter(logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    ))
+
+    root = logging.getLogger()
+    root.setLevel(logging.WARNING)
+    # Avoid adding duplicate handlers if launch() is somehow called twice
+    if not any(isinstance(h, RotatingFileHandler) for h in root.handlers):
+        root.addHandler(handler)
+
+    # Catch unhandled exceptions that slip past Qt's event loop
+    def _excepthook(exc_type, exc_value, exc_tb):
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        logging.getLogger("eventhawk.unhandled").critical(
+            "Unhandled exception:\n%s",
+            "".join(traceback.format_exception(exc_type, exc_value, exc_tb)),
+        )
+
+    sys.excepthook = _excepthook
 
 
 def launch(initial_paths: list[str] | None = None) -> None:
@@ -20,6 +66,8 @@ def launch(initial_paths: list[str] | None = None) -> None:
     (after the multiprocessing spawn guard) so child processes spawned
     by ProcessPoolExecutor don't try to open windows.
     """
+    _setup_gui_logging()
+
     # Required for frozen executables (PyInstaller) + ProcessPoolExecutor on Windows
     multiprocessing.freeze_support()
 
