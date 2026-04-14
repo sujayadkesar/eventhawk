@@ -7398,17 +7398,25 @@ class MainWindow(QMainWindow):
                     with open(path, "w", newline="", encoding="utf-8") as _f:
                         writer = _csv.writer(_f)
                         writer.writerow(col_names)
-                        writer.writerows(cursor)
+                        while True:
+                            _batch = cursor.fetchmany(5000)
+                            if not _batch:
+                                break
+                            writer.writerows(_batch)
                 else:  # json
                     with open(path, "w", encoding="utf-8") as _f:
                         _f.write("[\n")
                         _first = True
-                        for _row in cursor:
-                            if not _first:
-                                _f.write(",\n")
-                            _f.write(_json.dumps(dict(zip(col_names, _row)),
-                                                 default=str))
-                            _first = False
+                        while True:
+                            _batch = cursor.fetchmany(5000)
+                            if not _batch:
+                                break
+                            for _row in _batch:
+                                if not _first:
+                                    _f.write(",\n")
+                                _f.write(_json.dumps(dict(zip(col_names, _row)),
+                                                     default=str))
+                                _first = False
                         _f.write("\n]\n")
                 _exp_con.close()
                 QMessageBox.information(
