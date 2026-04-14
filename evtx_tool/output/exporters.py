@@ -1176,7 +1176,7 @@ def export_html(
                         val_str = str(v)
                         detail_parts.append(
                             f"<span class='detail-key'>{_esc(k)}:</span> "
-                            f"<span class='detail-val'>{_esc(val_str[:2000])}</span><br>")
+                            f"<span class='detail-val'>{_esc(val_str)}</span><br>")
                 detail_parts.append("</div>")
 
             detail_html = "\n".join(detail_parts)

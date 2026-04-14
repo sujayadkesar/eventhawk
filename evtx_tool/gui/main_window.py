@@ -7484,6 +7484,33 @@ class MainWindow(QMainWindow):
                 offset += len(rows)
                 if len(rows) < batch_limit:
                     break
+            # Enrich event_data from Parquet shards (Arrow table only has metadata columns)
+            _shard_paths = self._hw_model._get_shard_paths()
+            if _shard_paths and events:
+                try:
+                    import json as _json_ed
+                    import pyarrow as _pa_ed
+                    _key_tbl = _pa_ed.table({
+                        "k_src": [ev["source_file"] or "" for ev in events],
+                        "k_rid": [ev["record_id"] for ev in events],
+                    })
+                    _exp_con.register("_export_keys", _key_tbl)
+                    _ed_rows = _exp_con.execute(
+                        f"SELECT p.source_file, p.record_id, p.event_data_json "
+                        f"FROM parquet_scan({_shard_paths}) p "
+                        f"INNER JOIN _export_keys k "
+                        f"  ON p.source_file = k.k_src AND p.record_id = k.k_rid"
+                    ).fetchall()
+                    _ed_map = {(r[0], r[1]): r[2] for r in _ed_rows if r[2]}
+                    for _ev in events:
+                        _ed_json = _ed_map.get((_ev["source_file"], _ev["record_id"]))
+                        if _ed_json:
+                            try:
+                                _ev["event_data"] = _json_ed.loads(_ed_json)
+                            except Exception:
+                                pass
+                except Exception as _ed_exc:
+                    logger.warning("HTML/XML export: could not load event_data from Parquet: %s", _ed_exc)
             _exp_con.close()
 
             count = export(
