@@ -47,6 +47,12 @@ class _TimeAwareCalendar(QCalendarWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+        # Remove the unlabelled week-number column (Qt doesn't support a header
+        # label for it, so removing is cleaner than leaving it headerless).
+        self.setVerticalHeaderFormat(
+            QCalendarWidget.VerticalHeaderFormat.NoVerticalHeader
+        )
+
         # Build the time row
         time_container = QWidget()
         row = QHBoxLayout(time_container)
@@ -207,6 +213,7 @@ class FilterDialog(QDialog):
         types_layout.setSpacing(2)
         types_layout.setContentsMargins(8, 12, 8, 8)
 
+        self._chk_logalways   = QCheckBox("LogAlways")
         self._chk_verbose     = QCheckBox("Verbose")
         self._chk_information = QCheckBox("Information")
         self._chk_warning     = QCheckBox("Warning")
@@ -216,6 +223,7 @@ class FilterDialog(QDialog):
         self._chk_audit_failure = QCheckBox("Audit Failure")
 
         self._level_checks = {
+            "LogAlways":     self._chk_logalways,
             "Verbose":       self._chk_verbose,
             "Information":   self._chk_information,
             "Warning":       self._chk_warning,
@@ -375,6 +383,24 @@ class FilterDialog(QDialog):
         rel_row.addWidget(self._chk_rel_exclude)
         rel_row.addStretch()
         body.addLayout(rel_row)
+
+        # Specific day
+        specific_day_row = QHBoxLayout()
+        self._chk_specific_day = QCheckBox("Specific day")
+        self._chk_specific_day.setToolTip(
+            "Filter events for a single calendar day (00:00:00 – 23:59:59)"
+        )
+        specific_day_row.addWidget(self._chk_specific_day)
+        self._de_specific_day = QDateEdit()
+        self._de_specific_day.setCalendarPopup(True)
+        self._de_specific_day.setDate(QDate.currentDate())
+        self._de_specific_day.setDisplayFormat("dd-MM-yyyy")
+        self._de_specific_day.setEnabled(False)
+        specific_day_row.addWidget(self._de_specific_day)
+        specific_day_row.addStretch()
+        body.addLayout(specific_day_row)
+
+        self._chk_specific_day.toggled.connect(self._toggle_specific_day)
 
         body.addWidget(_styled_line())
 
@@ -569,9 +595,24 @@ class FilterDialog(QDialog):
     # =====================================================================
 
     def _toggle_date(self) -> None:
+        # Specific day takes priority — leave pickers disabled while it is active.
+        if self._chk_specific_day.isChecked():
+            return
         enabled = self._chk_date_enable.isChecked() or self._chk_time_enable.isChecked()
         self._dt_from.setEnabled(enabled)
         self._dt_to.setEnabled(enabled)
+
+    def _toggle_specific_day(self, checked: bool) -> None:
+        self._de_specific_day.setEnabled(checked)
+        if checked:
+            # Lock the From/To pickers while specific-day mode is active.
+            self._dt_from.setEnabled(False)
+            self._dt_to.setEnabled(False)
+        else:
+            # Restore From/To state based on the Date/Time checkboxes.
+            enabled = self._chk_date_enable.isChecked() or self._chk_time_enable.isChecked()
+            self._dt_from.setEnabled(enabled)
+            self._dt_to.setEnabled(enabled)
 
     def _open_picker(self, field: str, title: str, line_edit: QLineEdit) -> None:
         items = self._metadata.get(field, {})
@@ -590,12 +631,52 @@ class FilterDialog(QDialog):
             selected = dlg.selected_values()
             line_edit.setText(", ".join(sorted(selected)) if selected else "")
 
+    # Common event_data field names shown in the Name dropdown.
+    # Editable so users can still type any custom field name.
+    _COMMON_FIELDS = [
+        "",
+        # ── Logon / Account ──────────────────────────────────
+        "TargetUserName", "SubjectUserName",
+        "TargetDomainName", "SubjectDomainName",
+        "TargetUserSid", "SubjectUserSid",
+        "TargetLogonId", "SubjectLogonId",
+        "LogonType", "LogonProcessName", "AuthenticationPackageName",
+        "WorkstationName", "IpAddress", "IpPort",
+        "ElevatedToken", "TargetLinkedLogonId",
+        # ── Process ──────────────────────────────────────────
+        "NewProcessName", "ParentProcessName", "CommandLine",
+        "ProcessId", "SubjectProcessId",
+        # ── Object / Access ──────────────────────────────────
+        "ObjectName", "ObjectType", "AccessMask",
+        "HandleId", "OperationType",
+        # ── Privilege ────────────────────────────────────────
+        "PrivilegeList",
+        # ── Service / Task ───────────────────────────────────
+        "ServiceName", "ImagePath", "StartType", "ServiceType",
+        "TaskName", "TaskContent",
+        # ── Network / Firewall ───────────────────────────────
+        "DestAddress", "DestPort", "SourceAddress", "SourcePort",
+        "Protocol", "Direction", "Application",
+        # ── Sysmon ───────────────────────────────────────────
+        "RuleName", "UtcTime", "Hashes", "TargetFilename",
+        "PipeName", "SourceImage", "TargetImage",
+        # ── Top-level event fields ───────────────────────────
+        "event_id", "computer", "channel", "provider",
+        "level_name", "user_id",
+    ]
+
     def _add_condition(self) -> None:
         row = self._tbl_conditions.rowCount()
         self._tbl_conditions.insertRow(row)
 
-        # Name column — plain text
-        self._tbl_conditions.setItem(row, 0, QTableWidgetItem(""))
+        # Name column — editable combo with common field names
+        name_cmb = QComboBox()
+        name_cmb.setEditable(True)
+        name_cmb.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        name_cmb.addItems(self._COMMON_FIELDS)
+        name_cmb.setCurrentIndex(0)
+        name_cmb.setPlaceholderText("Field name…")
+        self._tbl_conditions.setCellWidget(row, 0, name_cmb)
 
         # Operator column — combo box
         cmb = QComboBox()
@@ -726,6 +807,16 @@ class FilterDialog(QDialog):
         self._chk_regex.setChecked(cfg.get("text_regex", False))
         self._chk_text_exclude.setChecked(cfg.get("text_exclude", False))
 
+        # Specific day — restore BEFORE the Date/Time checkboxes so that
+        # _toggle_date() sees the correct _chk_specific_day state when it
+        # fires and avoids a transient enable/disable flip on the pickers.
+        specific_day_date = cfg.get("specific_day_date", "")
+        if specific_day_date:
+            d = QDate.fromString(specific_day_date, "yyyy-MM-dd")
+            if d.isValid():
+                self._de_specific_day.setDate(d)
+        self._chk_specific_day.setChecked(cfg.get("specific_day_enabled", False))
+
         # Date/time
         self._chk_date_enable.setChecked(cfg.get("date_enabled", False))
         self._chk_time_enable.setChecked(cfg.get("time_enabled", False))
@@ -747,13 +838,17 @@ class FilterDialog(QDialog):
             for cond in cfg.get("conditions", []):
                 self._add_condition()
                 row = self._tbl_conditions.rowCount() - 1
-                self._tbl_conditions.item(row, 0).setText(cond.get("name", ""))
-                cmb = self._tbl_conditions.cellWidget(row, 1)
-                if cmb:
-                    idx = cmb.findText(cond.get("operator", "contains"))
+                name_cmb = self._tbl_conditions.cellWidget(row, 0)
+                if name_cmb:
+                    name_cmb.setCurrentText(cond.get("name", ""))
+                op_cmb = self._tbl_conditions.cellWidget(row, 1)
+                if op_cmb:
+                    idx = op_cmb.findText(cond.get("operator", "contains"))
                     if idx >= 0:
-                        cmb.setCurrentIndex(idx)
-                self._tbl_conditions.item(row, 2).setText(cond.get("value", ""))
+                        op_cmb.setCurrentIndex(idx)
+                val_item = self._tbl_conditions.item(row, 2)
+                if val_item:
+                    val_item.setText(cond.get("value", ""))
         finally:
             self._tbl_conditions.setUpdatesEnabled(True)
 
@@ -781,25 +876,29 @@ class FilterDialog(QDialog):
         # Date/time
         date_from = None
         date_to = None
-        if self._chk_date_enable.isChecked() or self._chk_time_enable.isChecked():
+        if self._chk_specific_day.isChecked():
+            # Specific-day mode: expand the chosen date to a full 24-hour window.
+            d = self._de_specific_day.date().toString("yyyy-MM-dd")
+            date_from = f"{d} 00:00:00"
+            date_to   = f"{d} 23:59:59"
+        elif self._chk_date_enable.isChecked() or self._chk_time_enable.isChecked():
             date_from = self._dt_from.dateTime().toString("yyyy-MM-dd HH:mm:ss")
             date_to = self._dt_to.dateTime().toString("yyyy-MM-dd HH:mm:ss")
 
         # Custom conditions
         conditions = []
         for row in range(self._tbl_conditions.rowCount()):
-            name_item = self._tbl_conditions.item(row, 0)
+            name_cmb  = self._tbl_conditions.cellWidget(row, 0)
             value_item = self._tbl_conditions.item(row, 2)
-            cmb = self._tbl_conditions.cellWidget(row, 1)
-            if name_item and value_item:
-                name_text = name_item.text().strip()
-                value_text = value_item.text().strip()
-                if name_text:
-                    conditions.append({
-                        "name": name_text,
-                        "operator": cmb.currentText() if cmb else "contains",
-                        "value": value_text,
-                    })
+            op_cmb    = self._tbl_conditions.cellWidget(row, 1)
+            name_text = (name_cmb.currentText().strip() if name_cmb else "")
+            value_text = (value_item.text().strip() if value_item else "")
+            if name_text:
+                conditions.append({
+                    "name":     name_text,
+                    "operator": op_cmb.currentText() if op_cmb else "contains",
+                    "value":    value_text,
+                })
 
         return {
             # Levels
@@ -826,6 +925,9 @@ class FilterDialog(QDialog):
             "date_from": date_from,
             "date_to": date_to,
             "date_exclude": self._chk_date_exclude.isChecked(),
+            # Specific day
+            "specific_day_enabled": self._chk_specific_day.isChecked(),
+            "specific_day_date": self._de_specific_day.date().toString("yyyy-MM-dd"),
             # Relative time
             "relative_days": self._spn_days.value(),
             "relative_hours": self._spn_hours.value(),

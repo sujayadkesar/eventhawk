@@ -495,7 +495,9 @@ def _hw_worker_stream(
     from evtx_tool.core.filters import compile_filter
 
     fpath = task["filepath"]
-    src   = os.path.basename(fpath)
+    # Use original_file when present so split shards (_hw_split_N_PID.evtx)
+    # are recorded in the DB under the user's actual filename (e.g. Security.evtx).
+    src   = task.get("original_file") or os.path.basename(fpath)
 
     _passes = None
     if task.get("filter_config"):
@@ -696,7 +698,13 @@ class HeavyweightEngine:
             if size_mb > 64 and n_workers > 1:
                 subs = _split_evtx(fp, n_workers, tmp_dir)
                 for s in subs:
-                    all_tasks.append({"filepath": s, "filter_config": filter_config})
+                    all_tasks.append({
+                        "filepath": s,
+                        "filter_config": filter_config,
+                        # Keep the original filename so source_file in the DB always
+                        # shows "Security.evtx", not "_hw_split_3_31312.evtx".
+                        "original_file": os.path.basename(fp),
+                    })
                     if s != fp:
                         tmp_sub_files.append(s)
             else:

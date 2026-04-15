@@ -422,10 +422,10 @@ tr.suspicious { background: #1c1208; } tr.suspicious:hover { background: #261a0a
 
 /* Detail / expand rows — increased font sizes */
 .detail-row td { background: #0d1117; white-space: pre-wrap; font-family: 'Consolas', 'Courier New', monospace;
-                 font-size: 1em; color: #c9d1d9; padding: 14px 20px; line-height: 1.65; }
-.detail-row .detail-section { margin-bottom: 12px; }
+                 font-size: 1em; color: #c9d1d9; padding: 10px 16px; line-height: 1.35; }
+.detail-row .detail-section { margin-bottom: 8px; }
 .detail-row .detail-section-title { color: #4fc3f7; font-weight: bold; font-size: 0.92em;
-                                    margin-bottom: 6px; border-bottom: 1px solid #21262d; padding-bottom: 3px; }
+                                    margin-bottom: 4px; border-bottom: 1px solid #21262d; padding-bottom: 3px; }
 .detail-row .detail-key { color: #8cf; font-weight: bold; display: inline-block; min-width: 180px; }
 .detail-row .detail-val { color: #e6edf3; font-size: 1em; }
 

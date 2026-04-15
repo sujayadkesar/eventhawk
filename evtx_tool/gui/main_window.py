@@ -396,6 +396,85 @@ class FileTabState:
 # FileTabState.proxy slot expects an EventFilterProxyModel interface.
 # This shim satisfies all the proxy calls made by main_window.py.
 
+class _JMSessionFetchWorker(QThread):
+    """Two-phase background worker for the JM session-filter DuckDB query.
+
+    Phase 1 — COUNT(*): fast metadata read, emits count_ready(n).
+    Phase 2 — row fetch: waits for proceed() from the main thread, then
+               runs the full SELECT and emits rows_ready(frozenset).
+
+    Both phases run entirely on the worker thread so the main thread never
+    blocks on a DuckDB query, regardless of the predicate complexity.
+
+    Flow:
+        worker.start()
+        # main thread enters QEventLoop
+        # worker emits count_ready(n)  →  main thread slot calls proceed(True/False)
+        # worker emits rows_ready(keys) or query_failed(msg)
+        # main thread slot calls loop.quit()
+    """
+    from PySide6.QtCore import Signal as _Sig
+    count_ready  = _Sig(int)      # emitted after COUNT(*), before fetch
+    rows_ready   = _Sig(object)   # frozenset[(source_file, record_id), ...]
+    query_failed = _Sig(str)      # error message
+
+    def __init__(self, duckdb_mod, scan_sql: str, where_sql: str,
+                 params: list, row_limit: int) -> None:
+        super().__init__()
+        self._duckdb    = duckdb_mod
+        self._scan_sql  = scan_sql
+        self._where_sql = where_sql
+        self._params    = params
+        self._row_limit = row_limit
+        import threading
+        self._proceed_event = threading.Event()
+        self._do_fetch      = True
+
+    def proceed(self, do_fetch: bool = True) -> None:
+        """Call from the main thread after receiving count_ready."""
+        self._do_fetch = do_fetch
+        self._proceed_event.set()
+
+    def run(self) -> None:
+        c = None
+        try:
+            c = self._duckdb.connect()
+
+            # Phase 1: COUNT(*) — fast on Parquet (reads footer metadata).
+            row = c.execute(
+                f"SELECT COUNT(*) FROM {self._scan_sql} WHERE {self._where_sql}",
+                self._params,
+            ).fetchone()
+            self.count_ready.emit(row[0] if row else 0)
+
+            # Pause here until the main thread calls proceed() or the timeout
+            # fires (5-minute safety net so the thread never hangs indefinitely).
+            self._proceed_event.wait(timeout=300.0)
+            if not self._do_fetch:
+                return   # user canceled — rows_ready intentionally not emitted
+
+            # Phase 2: full row fetch.
+            rows = c.execute(
+                f"SELECT source_file, record_id FROM {self._scan_sql} "
+                f"WHERE {self._where_sql} LIMIT {self._row_limit}",
+                self._params,
+            ).fetchall()
+            keys = frozenset(
+                (r[0] or "", r[1]) for r in rows if r[1] is not None
+            )
+            self.rows_ready.emit(keys)
+        except Exception as exc:
+            self.query_failed.emit(str(exc))
+        finally:
+            # Always close the connection — covers normal exit, early return,
+            # and exception paths so the DuckDB connection is never leaked.
+            if c is not None:
+                try:
+                    c.close()
+                except Exception:
+                    pass
+
+
 class _JMProxyShim:
     """Duck-type shim so JM per-file tabs satisfy the proxy interface."""
 
@@ -408,7 +487,8 @@ class _JMProxyShim:
 
     # Called by _set_session_filter / _clear_session_filter
     # Session filter for JM is handled at the top-level _hw_model; per-file
-    # tabs don't need it separately.
+    # tabs don't need it separately.  Accept **kwargs so callers can pass
+    # linked_lid= (and any future keyword args) without a TypeError.
     def set_session_filter(
         self,
         _logon_id,
@@ -416,6 +496,7 @@ class _JMProxyShim:
         _start_ts=None,
         _end_ts=None,
         _end_inclusive=False,
+        **_kwargs,      # absorbs linked_lid= and any future keyword args
     ) -> None:
         pass
 
@@ -1644,11 +1725,27 @@ class _LogonSessionDialog(QDialog):
         return None
 
     def _on_filter_clicked(self) -> None:
+        import logging as _log
         sess = self._selected_session()
         if not sess:
             QMessageBox.information(self, "No Selection", "Select a session row first.")
             return
-        self._on_filter_fn(sess["lid"], sess)
+        try:
+            _applied = self._on_filter_fn(sess["lid"], sess)
+        except Exception:
+            _log.getLogger("eventhawk.session").exception(
+                "Session filter callback failed for LogonId=%s", sess.get("lid")
+            )
+            QMessageBox.critical(
+                self, "Session Filter Error",
+                "An error occurred applying the session filter.\n"
+                "Details have been written to eventhawk_gui.log in the tool folder."
+            )
+            return
+        # False means the callback ran but no filter was applied (user canceled,
+        # or no matching events).  None / True both mean "filter active".
+        if _applied is False:
+            return
         self._filter_badge.setText(
             f"\U0001f510  Filtering:  {sess['user'] or '?'}  \u2022  "
             f"{sess['logon_type_label'] or '?'}  \u2022  "
@@ -5690,7 +5787,17 @@ class MainWindow(QMainWindow):
         _shard_list_captured = shard_list
         _hw_model = self._hw_model
 
-        def _jm_session_filter(logon_id: str | None, session_info: dict | None) -> None:
+        def _jm_session_filter(logon_id: str | None, session_info: dict | None):
+            import logging as _log
+            try:
+                return _jm_session_filter_impl(logon_id, session_info)
+            except Exception:
+                _log.getLogger("eventhawk.session").exception(
+                    "JM session filter raised an unhandled exception for LogonId=%s", logon_id
+                )
+                raise  # propagate so _on_filter_clicked can show the error dialog
+
+        def _jm_session_filter_impl(logon_id: str | None, session_info: dict | None) -> None:
             if logon_id is None:
                 _hw_model.clear_record_id_filter()
                 for _fm in self._jm_file_models:
@@ -5721,58 +5828,134 @@ class MainWindow(QMainWindow):
                         _end_inclusive = _lei
                     elif _le == _end_ts:
                         _end_inclusive = _end_inclusive or _lei
-            try:
-                _c = _duckdb.connect()
-                if _linked_lid:
-                    # Include events from the sibling split-token/UAC session too.
-                    _where_parts = [
-                        "("
-                        "json_extract_string(event_data_json, '$.TargetLogonId') IN (?, ?) "
-                        "OR json_extract_string(event_data_json, '$.SubjectLogonId') IN (?, ?)"
-                        ")"
-                    ]
-                    _params: list[object] = [logon_id, _linked_lid, logon_id, _linked_lid]
-                else:
-                    _where_parts = [
-                        "("
-                        "json_extract_string(event_data_json, '$.TargetLogonId') = ? "
-                        "OR json_extract_string(event_data_json, '$.SubjectLogonId') = ?"
-                        ")"
-                    ]
-                    _params: list[object] = [logon_id, logon_id]
-                if _computer:
-                    _where_parts.append("computer = ?")
-                    _params.append(_computer)
-                if _start_ts:
-                    _where_parts.append("timestamp_utc >= CAST(? AS TIMESTAMP)")
-                    _params.append(_start_ts)
-                if _end_ts:
-                    _where_parts.append(
-                        f"timestamp_utc {'<=' if _end_inclusive else '<'} CAST(? AS TIMESTAMP)"
-                    )
-                    _params.append(_end_ts)
-                _rid_rows = _c.execute(
-                    f"SELECT source_file, record_id FROM parquet_scan({_shard_list_captured}) "
-                    f"WHERE {' AND '.join(_where_parts)}",
-                    _params,
-                ).fetchall()
-                _c.close()
-                composite_keys = frozenset(
-                    (r[0] or "", r[1]) for r in _rid_rows if r[1] is not None
+            # ── Build WHERE clause ────────────────────────────────────────
+            _JM_SESSION_ROW_WARN  = 100_000   # warn before continuing
+            _JM_SESSION_ROW_LIMIT = 500_000   # hard cap
+
+            if _linked_lid:
+                _where_parts: list[str] = [
+                    "("
+                    "json_extract_string(event_data_json, '$.TargetLogonId') IN (?, ?) "
+                    "OR json_extract_string(event_data_json, '$.SubjectLogonId') IN (?, ?)"
+                    ")"
+                ]
+                _params: list[object] = [logon_id, _linked_lid, logon_id, _linked_lid]
+            else:
+                _where_parts = [
+                    "("
+                    "json_extract_string(event_data_json, '$.TargetLogonId') = ? "
+                    "OR json_extract_string(event_data_json, '$.SubjectLogonId') = ?"
+                    ")"
+                ]
+                _params = [logon_id, logon_id]
+            if _computer:
+                _where_parts.append("computer = ?")
+                _params.append(_computer)
+            if _start_ts:
+                _where_parts.append("timestamp_utc >= CAST(? AS TIMESTAMP)")
+                _params.append(_start_ts)
+            if _end_ts:
+                _where_parts.append(
+                    f"timestamp_utc {'<=' if _end_inclusive else '<'} CAST(? AS TIMESTAMP)"
                 )
-            except Exception:
-                # Fallback: use the concrete session's precomputed related
-                # keys; linked sibling pairs carry a union of both sessions'
-                # keys so the fallback stays consistent with the main query.
+                _params.append(_end_ts)
+            _where_sql = " AND ".join(_where_parts)
+            _scan_sql  = f"parquet_scan({_shard_list_captured})"
+
+            # ── Both phases run on the worker thread — main thread never blocks ──
+            # Phase 1 (COUNT) emits count_ready; main thread slot decides whether
+            # to proceed.  Phase 2 (row fetch) runs after proceed(True) is called.
+            # A single QEventLoop drives both phases so the Qt event loop stays
+            # alive (and the UI stays responsive) throughout.
+            from PySide6.QtWidgets import QApplication as _QApp, QProgressDialog as _QPD
+            from PySide6.QtCore import Qt as _Qt2, QEventLoop as _QEL
+
+            _query_result: list = [None, None]   # [frozenset | None, error_str | None]
+            _query_loop   = _QEL()
+            _canceled     = [False]
+
+            _worker = _JMSessionFetchWorker(
+                _duckdb, _scan_sql, _where_sql, _params, _JM_SESSION_ROW_LIMIT,
+            )
+
+            _progress = _QPD("Counting session events\u2026", "", 0, 0, self)
+            _progress.setWindowTitle("Session Filter")
+            _progress.setWindowModality(_Qt2.WindowModality.WindowModal)
+            _progress.setMinimumDuration(0)
+            _progress.setValue(0)
+            _progress.setCancelButton(None)   # hide cancel — we manage this ourselves
+
+            def _on_count(n: int) -> None:
+                if n > _JM_SESSION_ROW_WARN:
+                    _progress.hide()
+                    _ans = QMessageBox.question(
+                        self,
+                        "Large Session",
+                        f"This session matches {n:,} events.\n"
+                        "Applying the filter may take several seconds.\n\n"
+                        "Continue?",
+                        QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                        QMessageBox.StandardButton.No,
+                    )
+                    if _ans != QMessageBox.StandardButton.Yes:
+                        _canceled[0] = True
+                        _worker.proceed(False)
+                        _query_loop.quit()
+                        return
+                    _progress.setLabelText("Retrieving session events\u2026")
+                    _progress.show()
+                else:
+                    _progress.setLabelText("Retrieving session events\u2026")
+                _worker.proceed(True)
+
+            def _on_rows(keys) -> None:
+                _query_result[0] = keys
+                _progress.close()
+                _query_loop.quit()
+
+            def _on_failed(msg: str) -> None:
+                _query_result[1] = msg
+                _progress.close()
+                _query_loop.quit()
+
+            _worker.count_ready.connect(_on_count)
+            _worker.rows_ready.connect(_on_rows)
+            _worker.query_failed.connect(_on_failed)
+            # Show progress BEFORE starting the worker so the dialog is
+            # visible by the time count_ready arrives on the main thread.
+            _progress.show()
+            _worker.start()
+            _query_loop.exec()    # nested event loop — UI stays alive
+            _worker.wait()        # ensure thread fully joined before touching results
+
+            if _canceled[0]:
+                return False      # user clicked No on large-session dialog
+
+            if _query_result[1]:
+                # Worker raised — fall back to precomputed keys
+                import logging as _log
+                _log.getLogger("eventhawk.session").error(
+                    "JM session filter query failed for LogonId=%s (%s); "
+                    "falling back to precomputed keys.", logon_id, _query_result[1],
+                )
                 composite_keys = frozenset(
                     (session_info or {}).get("linked_related_keys")
                     or (session_info or {}).get("related_keys", ())
                 )
+            else:
+                composite_keys = _query_result[0] or frozenset()
+                if len(composite_keys) >= _JM_SESSION_ROW_LIMIT:
+                    import logging as _log
+                    _log.getLogger("eventhawk.session").warning(
+                        "JM session filter hit hard cap of %d rows for LogonId=%s; "
+                        "result set may be incomplete.",
+                        _JM_SESSION_ROW_LIMIT, logon_id,
+                    )
 
             if not composite_keys:
                 QMessageBox.information(self, "Logon Sessions",
                                         f"No events found for LogonId {logon_id}.")
-                return
+                return False  # no-op — do not update badge
 
             # Apply composite-key filter to merged model and all open per-file JM tabs.
             _hw_model.apply_bookmark_filter(composite_keys)
@@ -5782,6 +5965,7 @@ class MainWindow(QMainWindow):
             self._active_jm_session_keys = composite_keys
             self._update_session_filter_badge(logon_id, session_info)
             self._update_count_label()
+            return True  # filter successfully applied
 
         # Close any existing session browser (normal or JM) before opening a new one.
         self._close_logon_sessions_dlg()
@@ -5796,6 +5980,17 @@ class MainWindow(QMainWindow):
         dlg.activateWindow()
 
     def _set_session_filter(self, logon_id: str | None, session_info: dict | None) -> None:
+        """Apply or clear the session LogonId filter on all proxy models."""
+        import logging as _log
+        try:
+            self._set_session_filter_impl(logon_id, session_info)
+        except Exception:
+            _log.getLogger("eventhawk.session").exception(
+                "set_session_filter raised an exception for LogonId=%s", logon_id
+            )
+            raise  # propagate so _on_filter_clicked can show the error dialog
+
+    def _set_session_filter_impl(self, logon_id: str | None, session_info: dict | None) -> None:
         """Apply or clear the session LogonId filter on all proxy models."""
         # Extract host + time scope so the filter doesn't match same-LUID
         # sessions from other hosts or later reuse on the same host.
@@ -5818,15 +6013,19 @@ class MainWindow(QMainWindow):
                     scope_end_inclusive = _lei
                 elif _le == scope_end_ts:
                     scope_end_inclusive = scope_end_inclusive or _lei
+        # Pass linked_lid into set_session_filter() so all fields are committed
+        # atomically before the single invalidateFilter() call — avoids the
+        # double-invalidation that occurred when set_session_linked_lid() was
+        # called as a separate step.
         self._proxy_model.set_session_filter(
             logon_id, computer, scope_start_ts, scope_end_ts, scope_end_inclusive,
+            linked_lid=linked_lid,
         )
-        self._proxy_model.set_session_linked_lid(linked_lid)
         for state in self._file_tabs.values():
             state.proxy.set_session_filter(
                 logon_id, computer, scope_start_ts, scope_end_ts, scope_end_inclusive,
+                linked_lid=linked_lid,
             )
-            state.proxy.set_session_linked_lid(linked_lid)
         self._update_session_filter_badge(logon_id, session_info)
         self._update_count_label()
 
@@ -7168,14 +7367,17 @@ class MainWindow(QMainWindow):
             scope_end_incl = self._proxy_model.get_session_filter_end_inclusive()
             linked_lid     = self._proxy_model.get_session_linked_lid()
             if lid:
+                # Use the atomic form so the new proxy's filter is fully
+                # committed before its single invalidateFilter() call — avoids
+                # the extra invalidation that the old two-step path caused.
                 proxy.set_session_filter(
                     lid,
                     computer,
                     scope_start_ts,
                     scope_end_ts,
                     scope_end_incl,
+                    linked_lid=linked_lid,
                 )
-                proxy.set_session_linked_lid(linked_lid)
 
         # ── Tab bar: must be visible so user can navigate between tabs ────────
         # In merged mode the bar is collapsed to save space; un-collapse it now.
@@ -7792,6 +7994,13 @@ class MainWindow(QMainWindow):
         # ─────────────────────────────────────────────────────────────────
 
         self._event_model.set_events([])
+        # Clear bookmarks — events no longer exist after a reset
+        self._bookmarks.clear()
+        self._bookmarked_keys.clear()
+        self._refresh_bookmarks_tab()
+        self._btn_bookmark_event.setText("☆ Bookmark")
+        self._btn_bookmark_event.setChecked(False)
+        self._update_bookmark_highlights()
         self._clear_tactic_filter()
         self._detail_browser.clear()
         self._last_detail_key = None  # invalidate render cache on parse reset
@@ -8340,6 +8549,19 @@ class MainWindow(QMainWindow):
             })
         self._refresh_bookmarks_tab()
         self._update_bookmark_button(ev)
+        self._update_bookmark_highlights()
+
+    def _update_bookmark_highlights(self) -> None:
+        """Push current bookmarked keys to all models so rows are visually highlighted."""
+        keys = frozenset(self._bookmarked_keys)
+        if self._hw_model is not None:
+            self._hw_model.set_bookmark_highlights(keys)
+            for _fm in getattr(self, "_jm_file_models", []):
+                _fm.set_bookmark_highlights(keys)
+        else:
+            self._event_model.set_bookmark_highlights(keys)
+            for _state in self._file_tabs.values():
+                _state.model.set_bookmark_highlights(keys)
 
     def _update_bookmark_button(self, ev: dict) -> None:
         """Reflect this event's bookmark status in the detail-pane bookmark button."""
@@ -8436,6 +8658,17 @@ class MainWindow(QMainWindow):
         self._refresh_bookmarks_tab()
         self._btn_bookmark_event.setText("☆ Bookmark")
         self._btn_bookmark_event.setChecked(False)
+        # Clear any active bookmark filter so the table shows all events again
+        if self._hw_model is not None:
+            self._hw_model.clear_record_id_filter()
+            for _fm in getattr(self, "_jm_file_models", []):
+                _fm.clear_record_id_filter()
+        else:
+            self._proxy_model.clear_bookmark_filter()
+            for _state in self._file_tabs.values():
+                _state.proxy.clear_bookmark_filter()
+        # Remove amber highlight from all rows
+        self._update_bookmark_highlights()
 
     def _on_bookmark_double_click(self, index) -> None:
         """Double-click a bookmark row — pivot the main table to that single event."""

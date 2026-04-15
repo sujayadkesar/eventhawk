@@ -349,6 +349,24 @@ def _format_scriptblock_file(
     if "EncryptedMessage" in assembled or "EncryptedContent" in assembled:
         pel_note = "\n[PROTECTED_EVENT_LOGGING] — ScriptBlockText contains encrypted content.\n"
 
+    # Build per-fragment provenance lines (sorted by MessageNumber).
+    # Shows exactly which event record contributed each piece of the assembled
+    # script so analysts can cross-reference back to the raw EVTX log.
+    total_frags = acc.expected_total or max(acc.fragments.keys(), default=1)
+    frag_prov_lines: list[str] = []
+    for frag_num in range(1, total_frags + 1):
+        frag = acc.fragments.get(frag_num)
+        if frag is not None:
+            frag_prov_lines.append(
+                f"  [{frag_num:>3}/{total_frags}]  RecordID: {frag.record_id:<12}  "
+                f"Timestamp: {_fmt_ts(frag.timestamp)}"
+            )
+        else:
+            frag_prov_lines.append(
+                f"  [{frag_num:>3}/{total_frags}]  RecordID: MISSING"
+            )
+    frag_prov_block = "\n".join(frag_prov_lines) if frag_prov_lines else "  (none)"
+
     header = "\n".join([
         _SEP,
         "EventHawk — Reconstructed Script Block",
@@ -362,6 +380,9 @@ def _format_scriptblock_file(
         f"LoggingLevel   : {level_str}",
         f"ATT&CK         : {attck_str}",
         f"Indicators     : {indicators_str}",
+        "",
+        "Fragment Sources (RecordID per fragment):",
+        frag_prov_block,
         "",
         "Detected Patterns:",
         pattern_lines,

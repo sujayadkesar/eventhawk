@@ -72,10 +72,11 @@ _LEVEL_FG = {
     "LogAlways":   QColor("#9a8878"),
 }
 
-_BG_NORMAL  = QColor("#f5f0e8")
-_BG_ALT     = QColor("#ede8d8")
-_MONO_FONT  = QFont("Consolas", 9)
-_COLOR_GRAY = QColor("#9a8878")
+_BG_NORMAL   = QColor("#f5f0e8")
+_BG_ALT      = QColor("#ede8d8")
+_BG_BOOKMARK = QColor("#e8c96e")   # amber highlight for bookmarked rows
+_MONO_FONT   = QFont("Consolas", 9)
+_COLOR_GRAY  = QColor("#9a8878")
 
 # ── Visible window cache size ──────────────────────────────────────────────────
 # Rows loaded from Arrow per slice — amortises Python/C++ boundary call overhead.
@@ -423,6 +424,7 @@ class ArrowTableModel(QAbstractTableModel):
         self._quick_params: list[Any] = []
         self._record_id_where_sql = ""
         self._record_id_params: list[Any] = []
+        self._bookmarked_keys: frozenset = frozenset()  # (source_file, record_id) pairs
 
         self._sort_col = "timestamp_utc"
         self._sort_asc = True
@@ -504,6 +506,14 @@ class ArrowTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.ForegroundRole:
             return self._cell_fg(local, col)
         if role == Qt.ItemDataRole.BackgroundRole:
+            if self._bookmarked_keys:
+                sf  = self._v(local, "source_file")
+                rid = self._v(local, "record_id")
+                try:
+                    if (sf, int(rid)) in self._bookmarked_keys:
+                        return _BG_BOOKMARK
+                except (ValueError, TypeError):
+                    pass
             return _BG_ALT if row % 2 else _BG_NORMAL
         if role == Qt.ItemDataRole.TextAlignmentRole:
             if col in (COL_NUM, COL_EID, COL_RECORD_ID):
@@ -531,6 +541,14 @@ class ArrowTableModel(QAbstractTableModel):
 
     def _cell_text(self, local: int, abs_row: int, col: int) -> str:
         if col == COL_NUM:
+            if self._bookmarked_keys:
+                sf  = self._v(local, "source_file")
+                rid = self._v(local, "record_id")
+                try:
+                    if (sf, int(rid)) in self._bookmarked_keys:
+                        return f"★{abs_row + 1}"
+                except (ValueError, TypeError):
+                    pass
             return str(abs_row + 1)
         if col == COL_EID:
             return self._v(local, "event_id")
@@ -751,6 +769,20 @@ class ArrowTableModel(QAbstractTableModel):
         self._text_where_sql = ""
         self._text_params    = []
         self._invalidate()
+
+    def _get_shard_paths(self) -> list:
+        """Delegate to the filter thread's shard manifest loader."""
+        return self._filter_thread._get_shard_paths()
+
+    def set_bookmark_highlights(self, keys: "frozenset[tuple[str, int]]") -> None:
+        """Update which rows receive the amber bookmark highlight (visual only, no filtering)."""
+        self._bookmarked_keys = keys
+        n = self._total_rows
+        if n > 0:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(n - 1, len(COLUMNS) - 1),
+            )
 
     # ── Quick filters (right-click column filter) ─────────────────────────────
 

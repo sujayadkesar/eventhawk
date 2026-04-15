@@ -92,9 +92,10 @@ _LEVEL_FG = {
     "LogAlways":   QColor("#9a8878"),
 }
 
-_BG_NORMAL = QColor("#f5f0e8")
-_BG_ALT    = QColor("#ede8d8")
-_BG_SEL    = QColor("#ddd4bc")
+_BG_NORMAL    = QColor("#f5f0e8")
+_BG_ALT       = QColor("#ede8d8")
+_BG_SEL       = QColor("#ddd4bc")
+_BG_BOOKMARK  = QColor("#e8c96e")   # amber highlight for bookmarked rows
 
 # Mono font for source file column
 _MONO_FONT = QFont("Consolas", 9)
@@ -181,6 +182,7 @@ class EventTableModel(QAbstractTableModel):
         self._events: list[dict] = []
         self._search_cache: list[str] = []   # pre-lowered search strings
         self._header_overrides: dict[int, str] = {}  # col_idx → custom header text
+        self._bookmarked_keys: frozenset = frozenset()  # (source_file, record_id) pairs
 
     # ── Qt interface ──────────────────────────────────────────────────────────
 
@@ -219,6 +221,11 @@ class EventTableModel(QAbstractTableModel):
             return self._cell_fg(ev, col)
 
         if role == Qt.ItemDataRole.BackgroundRole:
+            if self._bookmarked_keys:
+                rid = ev.get("record_id")
+                sf  = ev.get("source_file", "")
+                if (sf, int(rid) if rid is not None else -1) in self._bookmarked_keys:
+                    return _BG_BOOKMARK
             return _BG_ALT if row % 2 else _BG_NORMAL
 
         if role == Qt.ItemDataRole.TextAlignmentRole:
@@ -242,6 +249,11 @@ class EventTableModel(QAbstractTableModel):
 
     def _cell_text(self, ev: dict, row: int, col: int) -> str:
         if col == COL_NUM:
+            if self._bookmarked_keys:
+                rid = ev.get("record_id")
+                sf  = ev.get("source_file", "")
+                if (sf, int(rid) if rid is not None else -1) in self._bookmarked_keys:
+                    return f"★{row + 1}"
             return str(row + 1)
         if col == COL_EID:
             return str(ev.get("event_id", ""))
@@ -434,6 +446,16 @@ class EventTableModel(QAbstractTableModel):
 
     def event_count(self) -> int:
         return len(self._events)
+
+    def set_bookmark_highlights(self, keys: "frozenset[tuple[str, int]]") -> None:
+        """Update which rows receive the amber bookmark highlight."""
+        self._bookmarked_keys = keys
+        n = len(self._events)
+        if n > 0:
+            self.dataChanged.emit(
+                self.index(0, 0),
+                self.index(n - 1, len(COLUMNS) - 1),
+            )
 
 
 # ── Proxy model (live text filter) ────────────────────────────────────────────
@@ -885,6 +907,7 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         start_ts: str | None = None,
         end_ts: str | None = None,
         end_inclusive: bool = False,
+        linked_lid: str | None = None,
     ) -> None:
         """
         Show only events that belong to a specific logon session.
@@ -895,11 +918,15 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         multi-host loads where different machines can share the same LUID.
         Optional *start_ts* / *end_ts* bounds further scope the filter to the
         concrete session instance so later LogonId reuse on the same host is
-        excluded. Pass None to clear.
+        excluded.  *linked_lid* widens the filter to include a sibling
+        split-token / UAC-elevated session.  Pass logon_id=None to clear.
+
+        All fields are set atomically before the single invalidateFilter() call
+        so the proxy is never re-scanned with a partially-updated state.
         """
         self._session_logon_id = logon_id
         self._session_computer = computer if logon_id else None
-        self._session_linked_lid = None   # set via set_session_linked_lid()
+        self._session_linked_lid = (linked_lid or None) if logon_id else None
         self._session_start_ts = start_ts if logon_id and start_ts else None
         self._session_end_ts = end_ts if logon_id and end_ts else None
         self._session_end_inclusive = bool(logon_id and self._session_end_ts and end_inclusive)
@@ -910,7 +937,7 @@ class EventFilterProxyModel(QSortFilterProxyModel):
             _filter_parse_ts(self._session_end_ts) if self._session_end_ts and _filter_parse_ts else None
         )
         self._update_filter_active()
-        self.invalidateFilter()
+        self.invalidateFilter()  # single pass — all fields already committed above
 
     def has_session_filter(self) -> bool:
         """Return True if a session filter is currently active."""
@@ -942,9 +969,15 @@ class EventFilterProxyModel(QSortFilterProxyModel):
 
     def set_session_linked_lid(self, linked_lid: str | None) -> None:
         """Set the sibling split-token session's LogonId so its events are
-        included when the primary session filter is active."""
+        included when the primary session filter is active.
+
+        Prefer passing linked_lid to set_session_filter() directly when
+        possible — it sets all fields atomically with a single invalidation.
+        This method exists for callers that need to update the linked lid
+        independently after the primary filter is already active.
+        """
         self._session_linked_lid = linked_lid or None
-        if self._session_logon_id:   # only re-filter if a session is active
+        if self._session_logon_id:
             self._update_filter_active()
             self.invalidateFilter()
 
@@ -960,8 +993,9 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         col = left.column()
         if col in (COL_NUM, COL_EID, COL_PID, COL_TID, COL_PROC_ID, COL_SID, COL_RECORD_ID):
             try:
-                lv = int(left.data(Qt.ItemDataRole.DisplayRole) or "0")
-                rv = int(right.data(Qt.ItemDataRole.DisplayRole) or "0")
+                # Strip bookmark star prefix ("★42" → "42") before int conversion
+                lv = int((left.data(Qt.ItemDataRole.DisplayRole) or "0").lstrip("★").strip() or "0")
+                rv = int((right.data(Qt.ItemDataRole.DisplayRole) or "0").lstrip("★").strip() or "0")
                 return lv < rv
             except (ValueError, TypeError):
                 pass
@@ -970,6 +1004,16 @@ class EventFilterProxyModel(QSortFilterProxyModel):
     # ── Core filter logic ─────────────────────────────────────────────────
 
     def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
+        try:
+            return self._filterAcceptsRow_impl(source_row, source_parent)
+        except Exception:
+            import logging as _log
+            _log.getLogger("eventhawk.filter").exception(
+                "filterAcceptsRow raised an exception at source_row=%d", source_row
+            )
+            return True  # show row rather than hide it on error
+
+    def _filterAcceptsRow_impl(self, source_row: int, source_parent: QModelIndex) -> bool:
         # FINDING-17: fast-path — skip all per-row checks when no filter is active.
         # This eliminates ~2M attribute accesses per sort/invalidation on 400K rows
         # in the idle (no-filter) state, which is the most common state.
