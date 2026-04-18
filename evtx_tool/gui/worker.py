@@ -16,13 +16,17 @@ thread by Qt's signal/slot mechanism — 100% thread-safe, GUI stays responsive.
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import threading
 import time
+import traceback
 from pathlib import Path
 
 from PySide6.QtCore import QThread, Signal
+
+logger = logging.getLogger(__name__)
 
 
 class ParseWorker(QThread):
@@ -69,8 +73,10 @@ class ParseWorker(QThread):
     def run(self) -> None:
         try:
             self._run_pipeline()
-        except Exception as exc:
-            self.error.emit(str(exc))
+        except Exception:
+            tb = traceback.format_exc()
+            logger.exception("ParseWorker pipeline failed")
+            self.error.emit(tb)
 
     def _run_pipeline(self) -> None:
         pkg_root = str(Path(__file__).resolve().parents[2])
@@ -109,7 +115,7 @@ class ParseWorker(QThread):
                 from evtx_tool.analysis.attack_mapping import enrich_and_summarize
                 attack_summary = enrich_and_summarize(events)
             except Exception:
-                pass
+                logger.warning("ATT&CK enrichment failed", exc_info=True)
 
         # ── 4.5. Semantic normalization (non-destructive _desc keys) ─────────
         # Translates raw hex/int codes to human-readable descriptions.
@@ -120,7 +126,7 @@ class ParseWorker(QThread):
                 from evtx_tool.analysis.normalizer import SemanticNormalizer
                 SemanticNormalizer.get().enrich_events(events)
             except Exception:
-                pass
+                logger.warning("Semantic normalization failed", exc_info=True)
 
         # ── 5. Build search cache (runs in THIS thread, not GUI thread) ──────
         # Perf: building 400K search strings takes ~5s. Doing it here keeps
@@ -185,8 +191,10 @@ class AnalysisWorker(QThread):
     def run(self) -> None:
         try:
             self._run_analysis()
-        except Exception as exc:
-            self.error.emit(str(exc))
+        except Exception:
+            tb = traceback.format_exc()
+            logger.exception("AnalysisWorker pipeline failed")
+            self.error.emit(tb)
 
     def _run_analysis(self) -> None:
         pkg_root = str(Path(__file__).resolve().parents[2])
@@ -204,7 +212,7 @@ class AnalysisWorker(QThread):
                 from evtx_tool.gui.metadata import build_metadata
                 metadata = build_metadata(self._events)
             except Exception:
-                pass
+                logger.warning("Metadata build failed", exc_info=True)
 
         # ── IOC Extraction ────────────────────────────────────────────────────
         if self._do_ioc and not self._stop_event.is_set():
@@ -213,7 +221,7 @@ class AnalysisWorker(QThread):
                 from evtx_tool.analysis.ioc_extractor import extract_iocs
                 iocs = extract_iocs(self._events)
             except Exception:
-                pass
+                logger.warning("IOC extraction failed", exc_info=True)
 
         # ── Correlation ───────────────────────────────────────────────────────
         if self._do_correlate and not self._stop_event.is_set():
@@ -222,7 +230,7 @@ class AnalysisWorker(QThread):
                 from evtx_tool.analysis.correlator import correlate
                 chains = correlate(self._events)
             except Exception:
-                pass
+                logger.warning("Correlation failed", exc_info=True)
 
         if not self._stop_event.is_set():
             self.finished.emit(iocs, chains, metadata)

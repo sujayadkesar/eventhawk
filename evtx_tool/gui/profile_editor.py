@@ -9,7 +9,11 @@ Supports all standard profile fields plus extended filter fields:
 
 from __future__ import annotations
 
+import logging
+
 from PySide6.QtCore import Qt
+
+logger = logging.getLogger(__name__)
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGroupBox,
     QLabel, QLineEdit, QTextEdit, QPushButton, QComboBox,
@@ -364,6 +368,7 @@ class ProfileEditorDialog(QDialog):
             self._result = p
             self.accept()
         except Exception as exc:
+            logger.exception("Failed to save profile")
             QMessageBox.critical(self, "Save Failed", str(exc))
 
     def _copy_as_new(self) -> None:

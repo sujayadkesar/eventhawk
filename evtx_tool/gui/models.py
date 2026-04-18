@@ -746,6 +746,9 @@ class EventFilterProxyModel(QSortFilterProxyModel):
             self._adv_date_to = None
             self._adv_date_active = False
             self._adv_date_exclude = False
+            self._adv_dt_mode = "range"
+            self._adv_date_from_d = self._adv_date_from_t = None
+            self._adv_date_to_d   = self._adv_date_to_t   = None
             self._adv_rel_cutoff = None
             self._adv_rel_exclude = False
             self._adv_conditions = []
@@ -767,7 +770,7 @@ class EventFilterProxyModel(QSortFilterProxyModel):
 
         # Levels
         levels = cfg.get("levels")
-        self._adv_levels = set(levels) if levels and len(levels) < 7 else None
+        self._adv_levels = set(levels) if levels and len(levels) < 8 else None
 
         # Source / category / user / computer → pre-lower
         self._adv_sources = [_low(s) for s in cfg.get("sources", [])]
@@ -794,10 +797,83 @@ class EventFilterProxyModel(QSortFilterProxyModel):
             self._adv_text = _low(text_search) if text_search else ""
 
         # Date/time — pre-parse
-        self._adv_date_active = bool(cfg.get("date_enabled") or cfg.get("time_enabled"))
+        # Determine filtering mode from the three checkboxes:
+        #   date_only  — compare the date portion only  (Date ✓, Time ✗)
+        #   time_only  — compare the time-of-day only   (Date ✗, Time ✓)
+        #   separate   — date portion AND time portion independently (Date ✓, Time ✓, Separately ✓)
+        #   range      — combined datetime range (Date ✓, Time ✓, Separately ✗, or specific_day)
+        _date_en  = bool(cfg.get("date_enabled"))
+        _time_en  = bool(cfg.get("time_enabled"))
+        _sep_en   = bool(cfg.get("separately_enabled"))
+        _spec_en  = bool(cfg.get("specific_day_enabled"))
+        self._adv_date_active = bool(_date_en or _time_en or _spec_en)
+        if _spec_en or (_date_en and _time_en and not _sep_en):
+            self._adv_dt_mode = "range"
+        elif _date_en and _time_en and _sep_en:
+            self._adv_dt_mode = "separate"
+        elif _date_en and not _time_en:
+            self._adv_dt_mode = "date_only"
+        elif _time_en and not _date_en:
+            self._adv_dt_mode = "time_only"
+        else:
+            self._adv_dt_mode = "range"
         self._adv_date_exclude = cfg.get("date_exclude", False)
         self._adv_date_from = _parse_ts(cfg.get("date_from")) if cfg.get("date_from") else None
-        self._adv_date_to = _parse_ts(cfg.get("date_to")) if cfg.get("date_to") else None
+        self._adv_date_to   = _parse_ts(cfg.get("date_to"))   if cfg.get("date_to")   else None
+
+        # ── Timezone correction ──────────────────────────────────────────
+        # The filter dialog emits date_from/date_to as naive strings in the
+        # user's *display* timezone (e.g. "2025-09-26 00:00:00" means midnight
+        # IST if the user is in IST).  _parse_ts() wrongly stamps them as UTC.
+        # Correct by re-interpreting the parsed datetime in the display timezone
+        # and converting to true UTC, so the comparison vs event timestamps
+        # (stored as UTC) matches what the user actually sees in the table.
+        if self._adv_date_from or self._adv_date_to:
+            from datetime import timezone as _tz, timedelta as _td
+            mode = _tz_state["mode"]
+            display_tz = None  # None means UTC — no shift needed
+            if mode == "local":
+                from datetime import datetime as _dt_now
+                # Get the system's local UTC offset right now
+                _local_offset = _dt_now.now().astimezone().utcoffset()
+                if _local_offset:
+                    display_tz = _tz(offset=_local_offset)
+            elif mode == "specific":
+                try:
+                    from zoneinfo import ZoneInfo
+                    display_tz = ZoneInfo(_tz_state["specific"])
+                except Exception:
+                    pass
+            elif mode == "custom":
+                display_tz = _tz(offset=_td(minutes=_tz_state["custom_offset_min"]))
+            # mode == "utc" → display_tz stays None → no conversion needed.
+
+            if display_tz is not None:
+                # Re-interpret: replace the (wrong) UTC tzinfo with the display
+                # timezone, then convert to true UTC.
+                if self._adv_date_from:
+                    self._adv_date_from = self._adv_date_from.replace(
+                        tzinfo=display_tz
+                    ).astimezone(_tz.utc)
+                if self._adv_date_to:
+                    self._adv_date_to = self._adv_date_to.replace(
+                        tzinfo=display_tz
+                    ).astimezone(_tz.utc)
+                # Force to "range" mode.  The date_only / time_only / separate
+                # modes extract .date() / .time() from the UTC-converted
+                # boundaries, but those parts do NOT correspond to the user's
+                # display-TZ calendar date or clock time.  Example: midnight
+                # IST (+5:30) → 18:30 UTC on the PREVIOUS day, so .date() is
+                # off by 1 and .time() inverts (18:30 > 18:29 → always False).
+                # The full datetime range comparison is correct after conversion.
+                if self._adv_dt_mode in ("date_only", "time_only", "separate"):
+                    self._adv_dt_mode = "range"
+
+        # Pre-extract date/time parts to avoid per-row method calls in filterAcceptsRow()
+        self._adv_date_from_d = self._adv_date_from.date() if self._adv_date_from else None
+        self._adv_date_from_t = self._adv_date_from.time() if self._adv_date_from else None
+        self._adv_date_to_d   = self._adv_date_to.date()   if self._adv_date_to   else None
+        self._adv_date_to_t   = self._adv_date_to.time()   if self._adv_date_to   else None
 
         # Relative time — pre-compute cutoff
         rel_days = cfg.get("relative_days", 0)
@@ -857,6 +933,10 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         include : bool
             True = show only rows with this value; False = exclude rows with this value.
         """
+        # Replace any existing filter for the same key to avoid impossible AND
+        # conditions (e.g. include "Security" AND include "System" on the same
+        # column would match nothing).  Mirrors JM mode behavior.
+        self._quick_filters = [f for f in self._quick_filters if f["key"] != key]
         self._quick_filters.append({
             "key": key,
             "value": str(value).lower(),
@@ -1151,10 +1231,13 @@ class EventFilterProxyModel(QSortFilterProxyModel):
                 if eid_int in self._adv_eid_exclude:
                     return False
 
-        # ── Source (provider) — pre-lowered sets ───────────────────────────
+        # ── Source (provider + channel) — pre-lowered sets ──────────────────
         if self._adv_sources:
-            val = _low(ev.get("provider", ""))
-            hit = any(s in val for s in self._adv_sources)
+            # Check both provider and channel to match JM mode (filter_sql.py),
+            # where the "Source" field searches both columns with OR logic.
+            prov = _low(ev.get("provider", ""))
+            chan = _low(ev.get("channel", ""))
+            hit = any(s in prov or s in chan for s in self._adv_sources)
             if self._adv_source_exclude:
                 if hit: return False
             else:
@@ -1171,7 +1254,19 @@ class EventFilterProxyModel(QSortFilterProxyModel):
 
         # ── User ────────────────────────────────────────────────────────────
         if self._adv_users:
-            val = _low(ev.get("user_id", "") or "")
+            # Align with JM mode which checks user_id, ed_subject_user, and
+            # ed_target_user (SubjectUserName / TargetUserName from event_data).
+            _ed_u = ev.get("event_data") or {}
+            if not isinstance(_ed_u, dict):
+                _ed_u = {}
+            _user_parts = [
+                ev.get("user_id") or "",
+                _ed_u.get("SubjectUserName") or "",
+                _ed_u.get("TargetUserName") or "",
+                _ed_u.get("SubjectUserSid") or "",
+                _ed_u.get("TargetUserSid") or "",
+            ]
+            val = _low(" ".join(str(p) for p in _user_parts if p))
             hit = any(u in val for u in self._adv_users)
             if self._adv_user_exclude:
                 if hit: return False
@@ -1226,11 +1321,37 @@ class EventFilterProxyModel(QSortFilterProxyModel):
             event_ts = _filter_parse_ts(ev.get("timestamp")) if _filter_parse_ts else None
             if event_ts is None:
                 return not self._adv_date_exclude
-            in_range = True
-            if self._adv_date_from and event_ts < self._adv_date_from:
-                in_range = False
-            if self._adv_date_to and event_ts > self._adv_date_to:
-                in_range = False
+            mode = self._adv_dt_mode
+            if mode == "date_only":
+                # Compare only the calendar date — time-of-day is ignored
+                ev_d    = event_ts.date()
+                in_range = (
+                    (self._adv_date_from_d is None or ev_d >= self._adv_date_from_d) and
+                    (self._adv_date_to_d   is None or ev_d <= self._adv_date_to_d)
+                )
+            elif mode == "time_only":
+                # Compare only the time-of-day — calendar date is ignored
+                ev_t    = event_ts.time()
+                in_range = (
+                    (self._adv_date_from_t is None or ev_t >= self._adv_date_from_t) and
+                    (self._adv_date_to_t   is None or ev_t <= self._adv_date_to_t)
+                )
+            elif mode == "separate":
+                # Date condition AND time condition applied independently
+                ev_d = event_ts.date()
+                ev_t = event_ts.time()
+                in_range = (
+                    (self._adv_date_from_d is None or ev_d >= self._adv_date_from_d) and
+                    (self._adv_date_to_d   is None or ev_d <= self._adv_date_to_d)   and
+                    (self._adv_date_from_t is None or ev_t >= self._adv_date_from_t) and
+                    (self._adv_date_to_t   is None or ev_t <= self._adv_date_to_t)
+                )
+            else:
+                # "range" — combined datetime comparison (also used for specific_day)
+                in_range = (
+                    (self._adv_date_from is None or event_ts >= self._adv_date_from) and
+                    (self._adv_date_to   is None or event_ts <= self._adv_date_to)
+                )
             if self._adv_date_exclude:
                 if in_range: return False
             else:
@@ -1250,11 +1371,19 @@ class EventFilterProxyModel(QSortFilterProxyModel):
 
         # ── Custom conditions (pre-lowered, pre-compiled regex) ─────────────
         if self._adv_conditions:
-            ed = ev.get("event_data", {}) or {}
+            ed = ev.get("event_data") or {}
             if not isinstance(ed, dict):
-                return False
+                ed = {}
             for cond in self._adv_conditions:
-                field_val = str(ed.get(cond["name"], "") or "")
+                name = cond["name"]
+                # Check top-level event fields first (event_id, computer,
+                # channel, provider, level_name, user_id, …), then fall back
+                # to event_data sub-fields.  This matches the condition
+                # dropdown which lists both top-level and event_data names.
+                raw_val = ev.get(name)
+                if raw_val is None:
+                    raw_val = ed.get(name)
+                field_val = str(raw_val or "")
                 if not self._adv_case_sensitive:
                     field_val = field_val.lower()
                 cv = cond["value"]

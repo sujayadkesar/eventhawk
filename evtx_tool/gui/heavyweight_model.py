@@ -154,13 +154,17 @@ class _FilterThread(QThread):
         from evtx_tool.core.heavyweight.filter_sql import filter_config_to_sql
 
         # Phase 1 — metadata filter
-        meta_sql = f"SELECT row_id, record_id FROM events WHERE {where_sql}"
+        # Select source_file alongside record_id so the Phase 2 JOIN uses a
+        # composite (record_id, source_file) key — bare record_id is not unique
+        # across multi-file loads and would mix rows from different files.
+        meta_sql = f"SELECT row_id, record_id, source_file FROM events WHERE {where_sql}"
         phase1 = con.execute(meta_sql, params).fetchall()
         if not phase1:
             return self._full_table.slice(0, 0)   # empty, preserve schema
 
-        row_ids    = [int(r[0]) for r in phase1]
-        record_ids = [int(r[1]) for r in phase1]
+        row_ids      = [int(r[0])       for r in phase1]
+        record_ids   = [int(r[1])       for r in phase1]
+        source_files = [str(r[2] or "") for r in phase1]
 
         # Phase 2 — condition filter via Parquet
         shards = self._get_shard_paths()
@@ -175,23 +179,33 @@ class _FilterThread(QThread):
         quoted = ", ".join(f"'{p}'" for p in shards)
         try:
             con2 = duckdb.connect()
-            # Register phase-1 record_ids as a tiny table for efficient JOIN
-            rid_tbl = pa.table({"record_id": pa.array(record_ids, type=pa.int64())})
+            # Composite (record_id, source_file) key prevents cross-file matches
+            rid_tbl = pa.table({
+                "record_id":   pa.array(record_ids,   type=pa.int64()),
+                "source_file": pa.array(source_files, type=pa.string()),
+            })
             con2.register("_p1_ids", rid_tbl)
             phase2_sql = (
-                f"SELECT p.record_id "
+                f"SELECT p.record_id, p.source_file "
                 f"FROM parquet_scan([{quoted}]) p "
-                f"JOIN _p1_ids f ON p.record_id = f.record_id "
+                f"JOIN _p1_ids f "
+                f"  ON p.record_id = f.record_id AND p.source_file = f.source_file "
                 f"WHERE {cond_sql}"
             )
-            passing_set = {r[0] for r in con2.execute(phase2_sql, cond_params).fetchall()}
+            passing_set = {
+                (r[0], r[1]) for r in con2.execute(phase2_sql, cond_params).fetchall()
+            }
             con2.close()
         except Exception as exc:
             logger.warning("Condition post-filter error: %s — using metadata-only result", exc)
             return self._full_table.take(row_ids)
 
-        # Phase 3 — keep only row_ids whose record_id passed conditions
-        final_row_ids = [row_ids[i] for i, rid in enumerate(record_ids) if rid in passing_set]
+        # Phase 3 — keep only row_ids whose (record_id, source_file) passed conditions
+        final_row_ids = [
+            row_ids[i]
+            for i, (rid, sf) in enumerate(zip(record_ids, source_files))
+            if (rid, sf) in passing_set
+        ]
         if not final_row_ids:
             return self._full_table.slice(0, 0)
         return self._full_table.take(final_row_ids)
@@ -227,13 +241,16 @@ class _FilterThread(QThread):
         )
 
         # Phase 1 — non-text metadata filter via Arrow
-        meta_sql = f"SELECT row_id, record_id FROM events WHERE {where_sql_no_text}"
+        # Select source_file so Phase 2 can use composite (record_id, source_file)
+        # key — bare record_id is not unique across multi-file loads.
+        meta_sql = f"SELECT row_id, record_id, source_file FROM events WHERE {where_sql_no_text}"
         phase1 = con.execute(meta_sql, params_no_text).fetchall()
         if not phase1:
             return self._full_table.slice(0, 0)
 
-        row_ids    = [int(r[0]) for r in phase1]
-        record_ids = [int(r[1]) for r in phase1]
+        row_ids      = [int(r[0])       for r in phase1]
+        record_ids   = [int(r[1])       for r in phase1]
+        source_files = [str(r[2] or "") for r in phase1]
 
         # Phase 2 — CONTAINS + optional conditions via Parquet
         shards = self._get_shard_paths()
@@ -265,15 +282,22 @@ class _FilterThread(QThread):
         quoted = ", ".join(f"'{p}'" for p in shards)
         try:
             con2 = duckdb.connect()
-            rid_tbl = pa.table({"record_id": pa.array(record_ids, type=pa.int64())})
+            # Composite (record_id, source_file) key — prevents cross-file row matches
+            rid_tbl = pa.table({
+                "record_id":   pa.array(record_ids,   type=pa.int64()),
+                "source_file": pa.array(source_files, type=pa.string()),
+            })
             con2.register("_p1_ids", rid_tbl)
             phase2_sql = (
-                f"SELECT p.record_id "
+                f"SELECT p.record_id, p.source_file "
                 f"FROM parquet_scan([{quoted}]) p "
-                f"JOIN _p1_ids f ON p.record_id = f.record_id "
+                f"JOIN _p1_ids f "
+                f"  ON p.record_id = f.record_id AND p.source_file = f.source_file "
                 f"WHERE {phase2_where}"
             )
-            passing_set = {r[0] for r in con2.execute(phase2_sql, phase2_params).fetchall()}
+            passing_set = {
+                (r[0], r[1]) for r in con2.execute(phase2_sql, phase2_params).fetchall()
+            }
             con2.close()
         except Exception as exc:
             logger.warning(
@@ -283,7 +307,11 @@ class _FilterThread(QThread):
             )
             return self._full_table.take(row_ids)
 
-        final_row_ids = [row_ids[i] for i, rid in enumerate(record_ids) if rid in passing_set]
+        final_row_ids = [
+            row_ids[i]
+            for i, (rid, sf) in enumerate(zip(record_ids, source_files))
+            if (rid, sf) in passing_set
+        ]
         if not final_row_ids:
             return self._full_table.slice(0, 0)
         return self._full_table.take(final_row_ids)
@@ -805,6 +833,33 @@ class ArrowTableModel(QAbstractTableModel):
         self._quick_filters.clear()
         self._quick_where_sql = ""
         self._quick_params    = []
+        self._invalidate()
+
+    def clear_all_filters(self) -> None:
+        """Reset every filter layer in one atomic batch — single _invalidate() call.
+
+        Clears: advanced filter, conditions, text search (both cfg and sql),
+        quick filters, and record-id/bookmark pivot.  Use this instead of
+        calling clear_filter() + clear_quick_filters() separately to avoid
+        dispatching two redundant _invalidate() round-trips per model.
+        """
+        # Advanced filter + conditions + text search cfg
+        self._base_where_sql      = "1=1"
+        self._base_params         = []
+        self._has_advanced_filter = False
+        self._conditions_cfg      = {}
+        self._text_search_cfg     = {}
+        # Standalone text filter (apply_text_filter path)
+        self._text_where_sql      = ""
+        self._text_params         = []
+        # Record-id / bookmark pivot
+        self._record_id_where_sql = ""
+        self._record_id_params    = []
+        # Quick column filters
+        self._quick_filters.clear()
+        self._quick_where_sql     = ""
+        self._quick_params        = []
+        # Single dispatch — all state already reset above
         self._invalidate()
 
     def set_quick_filters(self, filters: list[dict]) -> None:

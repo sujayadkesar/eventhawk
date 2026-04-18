@@ -84,6 +84,18 @@ SEARCH_TEXT_EXPR_FULL: str = (
 # literal and potentially cause a syntax error crash.
 _SAFE_JSON_KEY_RE = _re.compile(r"^[\w.\-]+$")
 
+# Top-level Arrow/Parquet columns that exist as real SQL columns in the
+# DuckDB table — NOT inside event_data_json.  Conditions on these names
+# must reference the column directly instead of going through
+# json_extract_string(event_data_json, '$.name'), which would always
+# return NULL for them.
+_TOP_LEVEL_COLS: frozenset[str] = frozenset({
+    "event_id", "level", "level_name", "channel", "provider",
+    "computer", "user_id", "timestamp_utc", "source_file",
+    "record_id", "task",
+    "ed_subject_user", "ed_target_user", "ed_ip_address", "ed_new_process",
+})
+
 # Windows Event Log level name → integer ID
 _LEVEL_NAME_TO_ID: dict[str, int] = {
     "LogAlways":   0,
@@ -185,39 +197,173 @@ def filter_config_to_sql(fc: dict) -> tuple[str, list[Any]]:
     # ── levels ────────────────────────────────────────────────────────────
     if fc.get("levels"):
         level_ints = [v for x in fc["levels"] if (v := _level_to_int(x)) is not None]
-        # Skip the clause when all 6 standard levels are present — that is
-        # equivalent to "no level filter" and avoids excluding level=0
-        # (LogAlways) events, which the filter dialog has no checkbox for.
+        # Collect level names that have no integer mapping (e.g. "Audit Success",
+        # "Audit Failure" — Windows keyword-based levels, not ETW integer levels).
+        level_names_only = [
+            x for x in fc["levels"]
+            if isinstance(x, str) and _level_to_int(x) is None
+        ]
+        # Skip the clause when ALL standard + keyword levels are present — that
+        # is equivalent to "no level filter".  The dialog has 8 checkboxes
+        # (6 standard + Audit Success + Audit Failure) and returns [] when all
+        # are checked; but if a profile passes all 8, skip the filter.
         _ALL_STANDARD = frozenset([0, 1, 2, 3, 4, 5])
-        if level_ints and set(level_ints) != _ALL_STANDARD:
-            ph = ", ".join("?" * len(level_ints))
-            clauses.append(f"level IN ({ph})")
-            params.extend(level_ints)
+        all_ints_present = (set(level_ints) == _ALL_STANDARD)
+        all_names_present = (
+            set(level_names_only) >= {"Audit Success", "Audit Failure"}
+        )
+        # Only skip if BOTH integer levels and keyword levels cover everything
+        if not (all_ints_present and (all_names_present or not level_names_only)):
+            sub_parts: list[str] = []
+            sub_params: list[Any] = []
+            if level_ints and set(level_ints) != _ALL_STANDARD:
+                ph = ", ".join("?" * len(level_ints))
+                sub_parts.append(f"level IN ({ph})")
+                sub_params.extend(level_ints)
+            if level_names_only:
+                ph = ", ".join("?" * len(level_names_only))
+                sub_parts.append(f"level_name IN ({ph})")
+                sub_params.extend(level_names_only)
+            if sub_parts:
+                clauses.append(f"({' OR '.join(sub_parts)})")
+                params.extend(sub_params)
 
     # ── date_from / date_to ───────────────────────────────────────────────
+    # timestamp_utc is stored as text 'YYYY-MM-DD HH:MM:SS'; SUBSTRING works.
+    # Mode is determined by the same checkbox flags used by the normal-mode filter:
+    #   date_only  → compare SUBSTRING(timestamp_utc, 1, 10)  (YYYY-MM-DD)
+    #   time_only  → compare SUBSTRING(timestamp_utc, 12, 8)  (HH:MM:SS)
+    #   separate   → both date portion AND time portion independently
+    #   range      → full timestamp_utc text comparison (existing behaviour)
     date_exclude = fc.get("date_exclude", False)
-    date_parts: list[str] = []
-    if fc.get("date_from"):
-        # timestamp_utc is stored as text 'YYYY-MM-DD HH:MM:SS'; text compare works.
-        _d = fc["date_from"].replace("Z", "").replace("T", " ")[:19]
-        if len(_d) >= 10:
-            date_parts.append("timestamp_utc >= ?")
-            params.append(_d)
+    _date_en     = bool(fc.get("date_enabled"))
+    _time_en     = bool(fc.get("time_enabled"))
+    _sep_en      = bool(fc.get("separately_enabled"))
+    _spec_en     = bool(fc.get("specific_day_enabled"))
+    date_from_raw = fc.get("date_from") or ""
+    date_to_raw   = fc.get("date_to")   or ""
+
+    if date_from_raw or date_to_raw:
+        # Normalise to 'YYYY-MM-DD HH:MM:SS' (strip Z / T separator)
+        def _norm(s: str) -> str:
+            return s.replace("Z", "").replace("T", " ")[:19]
+
+        df = _norm(date_from_raw) if date_from_raw else ""
+        dt = _norm(date_to_raw)   if date_to_raw   else ""
+
+        # Determine mode from checkbox flags
+        if _spec_en or (_date_en and _time_en and not _sep_en):
+            _dt_mode = "range"
+        elif _date_en and _time_en and _sep_en:
+            _dt_mode = "separate"
+        elif _date_en and not _time_en:
+            _dt_mode = "date_only"
+        elif _time_en and not _date_en:
+            _dt_mode = "time_only"
         else:
-            logger.warning("filter_sql: ignoring malformed date_from %r", fc["date_from"])
-    if fc.get("date_to"):
-        _d = fc["date_to"].replace("Z", "").replace("T", " ")[:19]
-        if len(_d) >= 10:
-            date_parts.append("timestamp_utc <= ?")
-            params.append(_d)
-        else:
-            logger.warning("filter_sql: ignoring malformed date_to %r", fc["date_to"])
-    if date_parts:
-        combined = " AND ".join(date_parts)
-        if date_exclude:
-            clauses.append(f"NOT ({combined})")
-        else:
-            clauses.append(f"({combined})")
+            _dt_mode = "range"  # fallback
+
+        # ── Timezone correction ──────────────────────────────────────────
+        # The filter dialog emits date_from/date_to in the user's display
+        # timezone (e.g. "2025-09-26 00:00:00" means midnight IST when the
+        # user views timestamps in IST).  timestamp_utc is stored in UTC.
+        # Convert the user's boundary values from the display TZ to UTC so
+        # the SQL comparison matches what the user sees in the table.
+        try:
+            from evtx_tool.gui.models import _tz_state
+            from datetime import datetime as _dt_cls, timezone as _tz, timedelta as _td
+
+            _mode = _tz_state.get("mode", "utc")
+            _disp_tz = None  # None = UTC, no conversion needed
+            if _mode == "local":
+                _local_off = _dt_cls.now().astimezone().utcoffset()
+                if _local_off:
+                    _disp_tz = _tz(offset=_local_off)
+            elif _mode == "specific":
+                try:
+                    from zoneinfo import ZoneInfo
+                    _disp_tz = ZoneInfo(_tz_state.get("specific", "UTC"))
+                except Exception:
+                    pass
+            elif _mode == "custom":
+                _disp_tz = _tz(offset=_td(minutes=_tz_state.get("custom_offset_min", 0)))
+
+            if _disp_tz is not None:
+                def _to_utc(s: str) -> str:
+                    """Re-interpret a 'YYYY-MM-DD HH:MM:SS' string from display TZ as UTC."""
+                    if not s or len(s) < 19:
+                        return s
+                    try:
+                        naive = _dt_cls.strptime(s[:19], "%Y-%m-%d %H:%M:%S")
+                        aware = naive.replace(tzinfo=_disp_tz)
+                        utc_dt = aware.astimezone(_tz.utc)
+                        return utc_dt.strftime("%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        return s
+                df = _to_utc(df) if df else ""
+                dt = _to_utc(dt) if dt else ""
+                # Force to "range" mode.  date_only / time_only / separate use
+                # SUBSTRING(timestamp_utc, ...) to compare just the date or
+                # time portion, but after TZ conversion those portions are in
+                # UTC — not the user's display timezone.  The full timestamp
+                # comparison is always correct after conversion.
+                if _dt_mode in ("date_only", "time_only", "separate"):
+                    _dt_mode = "range"
+        except Exception as _exc:
+            logger.debug("filter_sql: timezone correction skipped: %s", _exc)
+
+        date_parts: list[str] = []
+
+        if _dt_mode == "date_only":
+            if df and len(df) >= 10:
+                date_parts.append("SUBSTRING(timestamp_utc, 1, 10) >= ?")
+                params.append(df[:10])
+            if dt and len(dt) >= 10:
+                date_parts.append("SUBSTRING(timestamp_utc, 1, 10) <= ?")
+                params.append(dt[:10])
+
+        elif _dt_mode == "time_only":
+            _tf = df[11:19] if len(df) >= 19 else ("00:00:00" if df else "")
+            _tt = dt[11:19] if len(dt) >= 19 else ("23:59:59" if dt else "")
+            if _tf:
+                date_parts.append("SUBSTRING(timestamp_utc, 12, 8) >= ?")
+                params.append(_tf)
+            if _tt:
+                date_parts.append("SUBSTRING(timestamp_utc, 12, 8) <= ?")
+                params.append(_tt)
+
+        elif _dt_mode == "separate":
+            # Date range AND time-of-day range applied independently
+            if df and len(df) >= 10:
+                date_parts.append("SUBSTRING(timestamp_utc, 1, 10) >= ?")
+                params.append(df[:10])
+            if dt and len(dt) >= 10:
+                date_parts.append("SUBSTRING(timestamp_utc, 1, 10) <= ?")
+                params.append(dt[:10])
+            _tf = df[11:19] if len(df) >= 19 else ""
+            _tt = dt[11:19] if len(dt) >= 19 else ""
+            if _tf:
+                date_parts.append("SUBSTRING(timestamp_utc, 12, 8) >= ?")
+                params.append(_tf)
+            if _tt:
+                date_parts.append("SUBSTRING(timestamp_utc, 12, 8) <= ?")
+                params.append(_tt)
+
+        else:  # "range" — full timestamp comparison
+            if df and len(df) >= 10:
+                date_parts.append("timestamp_utc >= ?")
+                params.append(df)
+            elif date_from_raw:
+                logger.warning("filter_sql: ignoring malformed date_from %r", date_from_raw)
+            if dt and len(dt) >= 10:
+                date_parts.append("timestamp_utc <= ?")
+                params.append(dt)
+            elif date_to_raw:
+                logger.warning("filter_sql: ignoring malformed date_to %r", date_to_raw)
+
+        if date_parts:
+            combined = " AND ".join(date_parts)
+            clauses.append(f"NOT ({combined})" if date_exclude else f"({combined})")
 
     # ── relative_days / relative_hours ────────────────────────────────────
     try:
@@ -272,6 +418,12 @@ def filter_config_to_sql(fc: dict) -> tuple[str, list[Any]]:
         clauses.append(f"NOT {clause}" if cat_exclude else clause)
 
     # ── users ──────────────────────────────────────────────────────────────
+    # Checks user_id (System/Security header SID), ed_subject_user
+    # (SubjectUserName), and ed_target_user (TargetUserName) — all pre-extracted
+    # Arrow table columns.
+    # TODO: SubjectUserSid / TargetUserSid live only in event_data_json (Parquet)
+    # and therefore cannot be checked here without adding ed_subject_sid /
+    # ed_target_sid as pre-extracted columns to the Arrow schema (engine.py).
     if fc.get("users"):
         usr_exclude = fc.get("user_exclude", False)
         op = _like_op()
@@ -344,13 +496,29 @@ def filter_config_to_sql(fc: dict) -> tuple[str, list[Any]]:
         name = cond.get("name", "")
         if not name:
             continue
-        if not _SAFE_JSON_KEY_RE.match(name):
+
+        # Decide whether to reference the column directly (top-level) or via
+        # json_extract_string() (event_data sub-field).
+        if name in _TOP_LEVEL_COLS:
+            # Direct column reference — safe (name comes from a known allowlist).
+            # CAST to VARCHAR so all string operators work uniformly even on
+            # integer columns like event_id.
+            base_expr = f"CAST({name} AS VARCHAR)"
+        elif _SAFE_JSON_KEY_RE.match(name):
+            # Simple identifier — use dot notation: $.FieldName
+            base_expr = f"json_extract_string(event_data_json, '$.{name}')"
+        elif '"' not in name and "\\" not in name and "\x00" not in name:
+            # Field name contains spaces or other special characters but is
+            # otherwise safe — use JSONPath double-quote bracket notation:
+            # json_extract_string(col, '$."My Field Name"')
+            base_expr = f'json_extract_string(event_data_json, \'$."{name}"\')'
+        else:
             logger.warning("filter_sql: skipping condition with unsafe field name %r", name)
             continue
+
         op = cond.get("operator", "contains")
         val = cond.get("value", "")
-        # DuckDB: use json_extract_string() instead of SQLite's json_extract()
-        field_expr = f"json_extract_string(event_data_json, '$.{name}')"
+        field_expr = base_expr
         if not cs:
             field_expr = f"lower({field_expr})"
             val = val.lower()
@@ -359,24 +527,26 @@ def filter_config_to_sql(fc: dict) -> tuple[str, list[Any]]:
             clauses.append(f"CONTAINS(COALESCE({field_expr}, ''), ?)")
             params.append(val)
         elif op == "equals":
-            clauses.append(f"{field_expr} = ?")
+            clauses.append(f"COALESCE({field_expr}, '') = ?")
             params.append(val)
         elif op == "starts with":
-            clauses.append(f"{field_expr} LIKE ?")
-            params.append(f"{val}%")
+            clauses.append(f"COALESCE({field_expr}, '') LIKE ? ESCAPE '\\'")
+            params.append(f"{_escape_like(val)}%")
         elif op == "ends with":
-            clauses.append(f"{field_expr} LIKE ?")
-            params.append(f"%{val}")
+            clauses.append(f"COALESCE({field_expr}, '') LIKE ? ESCAPE '\\'")
+            params.append(f"%{_escape_like(val)}")
         elif op == "not contains":
             clauses.append(f"NOT CONTAINS(COALESCE({field_expr}, ''), ?)")
             params.append(val)
         elif op == "not equals":
-            clauses.append(f"{field_expr} != ?")
+            clauses.append(f"COALESCE({field_expr}, '') != ?")
             params.append(val)
         elif op == "regex":
-            # DuckDB native regex — case flag applied based on cs setting
+            # DuckDB native regex — case flag applied based on cs setting.
+            # Use base_expr (without lower()) so the regex sees the original case
+            # when cs=True; the 'i' flag handles case-insensitive matching.
             raw_val = cond.get("value", "")
-            raw_field = f"COALESCE(json_extract_string(event_data_json, '$.{name}'), '')"
+            raw_field = f"COALESCE({base_expr}, '')"
             if cs:
                 clauses.append(f"regexp_matches({raw_field}, ?)")
             else:

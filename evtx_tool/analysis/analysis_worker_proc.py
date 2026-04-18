@@ -28,11 +28,53 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import traceback
 from concurrent.futures import ThreadPoolExecutor, Future
 from multiprocessing.shared_memory import SharedMemory
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+def _setup_worker_file_logging() -> None:
+    """
+    Wire the root logger in this worker subprocess to the same rotating log
+    file used by the GUI process.  On Windows, each mp.Process(spawn) gets a
+    fresh interpreter with no file handlers — without this, every
+    logger.warning() call inside the worker is silently discarded.
+    """
+    try:
+        from logging.handlers import RotatingFileHandler
+        log_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "..", "..", "evtx_tool_logs",
+        )
+        os.makedirs(log_dir, exist_ok=True)
+        log_path = os.path.join(log_dir, "eventhawk_gui.log")
+
+        root = logging.getLogger()
+        # Avoid adding a duplicate handler if somehow called twice
+        if any(
+            isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", "").endswith("eventhawk_gui.log")
+            for h in root.handlers
+        ):
+            return
+
+        handler = RotatingFileHandler(
+            log_path,
+            maxBytes=5 * 1024 * 1024,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        handler.setLevel(logging.WARNING)
+        handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%Y-%m-%d %H:%M:%S",
+        ))
+        root.setLevel(logging.WARNING)
+        root.addHandler(handler)
+    except Exception:
+        pass  # non-fatal — worker still runs without file logging
 
 
 # ── Priority & affinity helpers ───────────────────────────────────────────────
@@ -116,6 +158,7 @@ def run_analysis(
     evtx_paths : list[str] or None
         EVTX file/directory paths (needed for Hayabusa).
     """
+    _setup_worker_file_logging()
     try:
         _set_low_priority()
         _set_cpu_affinity()
@@ -125,9 +168,11 @@ def run_analysis(
             do_ioc, do_correlate, do_hayabusa,
             hayabusa_path, evtx_paths,
         )
-    except Exception as exc:
+    except Exception:
+        tb = traceback.format_exc()
+        logger.error("Analysis worker process failed:\n%s", tb)
         try:
-            progress_q.put({"type": "error", "message": str(exc)})
+            progress_q.put({"type": "error", "message": tb})
         except Exception:
             pass  # Queue itself may be broken if parent is gone
 

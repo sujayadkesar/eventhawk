@@ -10,12 +10,15 @@ Layout (3-panel + status bar):
 
 from __future__ import annotations
 
+import logging
 import os
 import sys
 import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import (
     QModelIndex, QPoint, QSortFilterProxyModel, Qt, QThread, QTimer, Signal, Slot,
@@ -4398,15 +4401,24 @@ class MainWindow(QMainWindow):
                     ("computer", "computer"),
                 ):
                     rows = _con.execute(
-                        f"SELECT DISTINCT {col} FROM events "
+                        f"SELECT {col}, COUNT(*) FROM events "
                         f"WHERE {col} IS NOT NULL AND {col} != '' "
-                        f"ORDER BY {col} LIMIT 500"
+                        f"GROUP BY {col} "
+                        f"ORDER BY COUNT(*) DESC LIMIT 500"
                     ).fetchall()
-                    meta[key] = {r[0]: 1 for r in rows}
+                    meta[key] = {r[0]: r[1] for r in rows}
                 eid_rows = _con.execute(
-                    "SELECT DISTINCT event_id FROM events ORDER BY event_id LIMIT 2000"
+                    "SELECT event_id, COUNT(*) FROM events "
+                    "GROUP BY event_id ORDER BY COUNT(*) DESC LIMIT 2000"
                 ).fetchall()
-                meta["event_id"] = {str(r[0]): 1 for r in eid_rows}
+                meta["event_id"] = {str(r[0]): r[1] for r in eid_rows}
+                # Level names for the filter dialog level checkboxes
+                lvl_rows = _con.execute(
+                    "SELECT level_name, COUNT(*) FROM events "
+                    "WHERE level_name IS NOT NULL AND level_name != '' "
+                    "GROUP BY level_name ORDER BY COUNT(*) DESC"
+                ).fetchall()
+                meta["level"] = {r[0]: r[1] for r in lvl_rows}
                 _con.close()
             except Exception as exc:
                 _logger.warning("_load_jm_metadata background worker failed: %s", exc)
@@ -4419,6 +4431,56 @@ class MainWindow(QMainWindow):
     def _on_jm_metadata_loaded(self, meta: dict) -> None:
         """Receive FilterDialog metadata loaded by the background worker thread."""
         self._metadata = meta
+
+    def _query_jm_metadata_sync(self) -> dict:
+        """Query JM metadata synchronously from the Arrow table (main-thread fallback).
+
+        Called when the user opens the Advanced Filter dialog and the background
+        metadata loader hasn't completed (or silently failed).  Typically finishes
+        in < 200 ms even on multi-million-row tables thanks to DuckDB's vectorised
+        GROUP BY on dict-encoded Arrow columns.
+        """
+        import logging as _log
+        _logger = _log.getLogger(__name__)
+        meta: dict = {}
+        if self._hw_model is None:
+            return meta
+        try:
+            import duckdb
+            arrow_table = self._hw_model._full_table
+            _con = duckdb.connect()
+            _con.register("events", arrow_table)
+            for col, key in (
+                ("provider", "source"),
+                ("channel",  "category"),
+                ("user_id",  "user"),
+                ("computer", "computer"),
+            ):
+                rows = _con.execute(
+                    f"SELECT {col}, COUNT(*) FROM events "
+                    f"WHERE {col} IS NOT NULL AND {col} != '' "
+                    f"GROUP BY {col} "
+                    f"ORDER BY COUNT(*) DESC LIMIT 500"
+                ).fetchall()
+                meta[key] = {r[0]: r[1] for r in rows}
+            eid_rows = _con.execute(
+                "SELECT event_id, COUNT(*) FROM events "
+                "GROUP BY event_id ORDER BY COUNT(*) DESC LIMIT 2000"
+            ).fetchall()
+            meta["event_id"] = {str(r[0]): r[1] for r in eid_rows}
+            lvl_rows = _con.execute(
+                "SELECT level_name, COUNT(*) FROM events "
+                "WHERE level_name IS NOT NULL AND level_name != '' "
+                "GROUP BY level_name ORDER BY COUNT(*) DESC"
+            ).fetchall()
+            meta["level"] = {r[0]: r[1] for r in lvl_rows}
+            _con.close()
+            _logger.info("_query_jm_metadata_sync: loaded %d sources, %d categories, %d users, %d computers",
+                         len(meta.get("source", {})), len(meta.get("category", {})),
+                         len(meta.get("user", {})), len(meta.get("computer", {})))
+        except Exception as exc:
+            _logger.warning("_query_jm_metadata_sync failed: %s", exc)
+        return meta
 
     def _on_hw_row_selected(self) -> None:
         """Handle row selection in Juggernaut Mode — fetch event via active tab's model."""
@@ -4718,7 +4780,29 @@ class MainWindow(QMainWindow):
             lambda col, order, tbl=self._active_table:
                 self._on_sort_by_column(col, tbl, force_order=order)
         )
-        popup.move(global_pos)
+        # ── Screen-edge clamping ──────────────────────────────────────────────
+        # For the rightmost columns the popup extends off the right edge of the
+        # screen.  Force Qt to compute the popup's real size first, then shift
+        # its x so the right edge stays within the available screen area.
+        # Also guard against clipping off the bottom (e.g. table near taskbar).
+        popup.adjustSize()
+        p = QPoint(global_pos)
+        screen = QApplication.screenAt(p) or QApplication.primaryScreen()
+        if screen is not None:
+            avail = screen.availableGeometry()
+            pw    = popup.width()
+            ph    = popup.height()
+            # Right-edge clip: align popup's right edge to column's right edge
+            if p.x() + pw > avail.right() + 1:
+                sect_right = (hdr.sectionPosition(logical_index)
+                              + hdr.sectionSize(logical_index)
+                              - hdr.offset())
+                global_right = hdr.mapToGlobal(QPoint(sect_right, 0)).x()
+                p.setX(max(avail.left(), global_right - pw))
+            # Bottom-edge clip: flip popup above the header row
+            if p.y() + ph > avail.bottom() + 1:
+                p.setY(max(avail.top(), global_pos.y() - hdr.height() - ph))
+        popup.move(p)
         popup.show()
 
     def _on_col_filter_applied(self, col_index: int, excluded: list) -> None:
@@ -5218,7 +5302,11 @@ class MainWindow(QMainWindow):
     def _on_analysis_finished(self, iocs, chains, metadata) -> None:
         self._iocs     = iocs
         self._chains   = chains or []
-        self._metadata = metadata or {}
+        # In Juggernaut Mode the analysis subprocess runs with events=[] so
+        # build_metadata() returns all-empty dicts.  _load_jm_metadata() has
+        # already populated self._metadata from DuckDB — don't overwrite it.
+        if self._hw_model is None:
+            self._metadata = metadata or {}
 
         # Build IOC pivot map — (category_key, value) → frozenset[record_id].
         # This is the single source of truth for exact event linking at pivot time.
@@ -5269,6 +5357,16 @@ class MainWindow(QMainWindow):
         self._btn_stop.setEnabled(False)
         self._analysis_runner = None
         self._set_status("Done (analysis failed)")
+        logger.error("Analysis worker failed:\n%s", msg)
+        err_dlg = QMessageBox(self)
+        err_dlg.setWindowTitle("Analysis Failed")
+        err_dlg.setIcon(QMessageBox.Icon.Warning)
+        err_dlg.setText(
+            "An analysis step failed (IOC extraction / Correlation / Metadata).\n\n"
+            "Event table is still populated — parse results are unaffected."
+        )
+        err_dlg.setDetailedText(msg)
+        err_dlg.exec()
 
 
     @Slot(str)
@@ -5308,6 +5406,13 @@ class MainWindow(QMainWindow):
 
     def _on_advanced_filter_clicked(self) -> None:
         """Open the ELE-style advanced filter dialog."""
+        # In Juggernaut Mode, guarantee metadata is populated before opening
+        # the dialog.  The background thread loader (_load_jm_metadata) may
+        # not have completed yet, or may have silently failed.  This fallback
+        # queries the Arrow table synchronously — typically < 200ms.
+        if self._hw_model is not None and not self._metadata.get("source"):
+            self._metadata = self._query_jm_metadata_sync()
+
         dlg = FilterDialog(
             metadata=self._metadata,
             current_filter=self._adv_filter_cfg,
@@ -5361,10 +5466,17 @@ class MainWindow(QMainWindow):
         # Bug 3 fix: in Juggernaut Mode clear via hw_model
         if self._hw_model is not None:
             self._hw_model.clear_filter()
+            # Also clear per-file tab filters (separate-tabs mode)
+            for _fp, _st in self._file_tabs.items():
+                if not _fp.startswith("__chain__"):
+                    _st.model.clear_filter()
             self._update_adv_filter_badge()
             self._update_count_label()
             return
         self._active_proxy.clear_advanced_filter()
+        # Also clear per-file tab proxies (separate-tabs mode)
+        for _st in self._file_tabs.values():
+            _st.proxy.clear_advanced_filter()
         self._update_adv_filter_badge()
         self._update_count_label()
 
@@ -5378,10 +5490,9 @@ class MainWindow(QMainWindow):
         # 1. Advanced filter
         self._adv_filter_cfg = None
 
-        # 3. Record-ID filter (IOC pivot, missing-record-ID) + bookmark filter
+        # 2. Record-ID filter (IOC pivot, missing-record-ID) + bookmark filter
+        #    + quick filters + text search — batch ALL resets then _invalidate() once.
         if self._hw_model is not None:
-            # Batch all state resets then call _invalidate() once to avoid
-            # queuing 4 separate filter-thread requests per button click.
             self._hw_model._base_where_sql       = "1=1"
             self._hw_model._base_params          = []
             self._hw_model._has_advanced_filter  = False
@@ -5391,30 +5502,29 @@ class MainWindow(QMainWindow):
             self._hw_model._text_params          = []
             self._hw_model._record_id_where_sql  = ""
             self._hw_model._record_id_params     = []
+            # Quick filters — clear in the same batch to avoid double _invalidate()
+            self._hw_model._quick_filters.clear()
+            self._hw_model._quick_where_sql = ""
+            self._hw_model._quick_params    = []
+            # Single dispatch for all resets
             self._hw_model._invalidate()
             # Also clear record-id/bookmark filters on open per-file JM tab models.
             for _fm in getattr(self, "_jm_file_models", []):
                 _fm.clear_record_id_filter()
             self._active_jm_session_keys = frozenset()
+            # Also clear filters on any open per-file JM tab models.
+            # Use clear_all_filters() to reset everything in one _invalidate()
+            # call instead of calling clear_filter() + clear_quick_filters()
+            # separately (which would dispatch two redundant round-trips each).
+            for _fp, _st in self._file_tabs.items():
+                if not _fp.startswith("__chain__"):
+                    _st.model.clear_all_filters()
         else:
             # Batch: clear all filter layers in one invalidateFilter() call.
             self._active_proxy.clear_all_filters()
             # Also clear per-file tab proxies in one pass each.
             for state in self._file_tabs.values():
                 state.proxy.clear_all_filters()
-
-        # 4. Quick column filters — JM only (normal mode handled above)
-        if self._hw_model is not None:
-            if self._hw_model._quick_filters:
-                self._hw_model._quick_filters.clear()
-                self._hw_model._quick_where_sql = ""
-                self._hw_model._quick_params    = []
-                self._hw_model._invalidate()
-            # Also clear filters on any open per-file JM tab models
-            for _fp, _st in self._file_tabs.items():
-                if not _fp.startswith("__chain__"):
-                    _st.model.clear_filter()
-                    _st.model.clear_quick_filters()
 
         # 5. Session filter — JM: cleared above (step 3 resets _hw_model + per-file models
         #    + _active_jm_session_keys).  Normal mode: cleared by clear_all_filters() above.
@@ -6739,6 +6849,7 @@ class MainWindow(QMainWindow):
             dlg = ThreatIntelDialog(parent=self)
             dlg.exec()
         except Exception as exc:
+            logger.exception("Failed to open Threat Intel dialog")
             QMessageBox.critical(self, "Threat Intel Error", str(exc))
 
     # ── IOC right-click context menu ──────────────────────────────────────────
@@ -6941,6 +7052,7 @@ class MainWindow(QMainWindow):
                 f"Exported {len(filtered):,} events to:\n{path}"
             )
         except Exception as exc:
+            logger.exception("ATT&CK tactic CSV export failed: %s", path)
             QMessageBox.critical(self, "Export Failed", str(exc))
 
     def _filter_by_tactic_dialog(self, tactic: str) -> None:
@@ -7112,6 +7224,7 @@ class MainWindow(QMainWindow):
 
             QMessageBox.information(self, "IOCs Exported", msg)
         except Exception as exc:
+            logger.exception("IOC export failed: %s", path)
             QMessageBox.critical(self, "Export Failed", str(exc))
 
     def _refresh_chains_tab(self) -> None:
@@ -7496,6 +7609,7 @@ class MainWindow(QMainWindow):
                 f"Exported {count:,} events to:\n{path}"
             )
         except Exception as exc:
+            logger.exception("Event export failed: %s", path)
             QMessageBox.critical(self, "Export Failed", str(exc))
 
     def _export_separate(self, file_paths: list[str]) -> None:
@@ -7541,6 +7655,7 @@ class MainWindow(QMainWindow):
                 f"Exported {total_events:,} events across {exported_files} files to:\n{out_dir}"
             )
         except Exception as exc:
+            logger.exception("Per-file export failed: %s", out_dir)
             QMessageBox.critical(self, "Export Failed", str(exc))
 
     def _export_juggernaut(self) -> None:
@@ -7726,6 +7841,7 @@ class MainWindow(QMainWindow):
                 f"Exported {count:,} events to:\n{path}"
             )
         except Exception as exc:
+            logger.exception("Juggernaut export failed: %s", path)
             QMessageBox.critical(self, "Export Failed", str(exc))
 
     # =========================================================================
@@ -7914,7 +8030,7 @@ class MainWindow(QMainWindow):
             try:
                 os.startfile(output_dir)
             except Exception:
-                pass
+                logger.warning("Failed to open output folder: %s", output_dir, exc_info=True)
 
     @Slot(str)
     def _on_ps_error(self, tb: str) -> None:

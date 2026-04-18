@@ -12,9 +12,12 @@ calls self._refresh_iocs_tab() to update the display.
 
 from __future__ import annotations
 
+import logging
 import threading
 
 from PySide6.QtCore    import Qt, QTimer, Signal, QObject
+
+logger = logging.getLogger(__name__)
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFileDialog,
     QHBoxLayout, QLabel, QLineEdit, QMessageBox,
@@ -292,6 +295,7 @@ class ThreatIntelDialog(QDialog):
             self._btn_apply_offline.setEnabled(count > 0)
             self._lbl_status.setText(f"Loaded {count:,} indicators from file.")
         except Exception as exc:
+            logger.exception("Failed to load offline IOC file: %s", path)
             QMessageBox.critical(self, "Load Failed", str(exc))
 
     def _on_apply_offline(self) -> None:
@@ -379,6 +383,7 @@ class ThreatIntelDialog(QDialog):
 
     def _on_error(self, message: str) -> None:
         self._set_running(False)
+        logger.error("Threat Intel worker error: %s", message)
         self._lbl_status.setText(f"Error: {message}")
         QMessageBox.critical(self, "Threat Intel Error", message)
 

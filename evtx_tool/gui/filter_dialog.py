@@ -14,10 +14,13 @@ Full-featured filter dialog with:
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime, timedelta
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import Qt, QDateTime, QDate, QTime
 from PySide6.QtGui import QFont, QIcon
@@ -42,7 +45,22 @@ class _TimeAwareCalendar(QCalendarWidget):
 
     Used by _DateTimePickerEdit so the user can set both date AND time from
     a single popup instead of having to click inside the text field segments.
+
+    Layout notes
+    ------------
+    Injecting an extra row into the calendar's internal VBoxLayout increases
+    the required popup height by ~42 px.  Two things guarantee the popup is
+    never clipped:
+
+    1. sizeHint() is overridden so Qt's popup-creation code always reads the
+       correct (taller) size.
+    2. setMinimumWidth(280) prevents the 7 weekday column headers from being
+       squeezed until they truncate to "…".
     """
+
+    # Height added by the time row: QTimeEdit(23) + top/bottom margins(4+7) +
+    # internal spacing(4) + a small fudge for borders = 42 px.
+    _TIME_ROW_H: int = 42
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -86,6 +104,26 @@ class _TimeAwareCalendar(QCalendarWidget):
         if main_layout is not None:
             main_layout.addWidget(time_container)
 
+        # Minimum width: enough for 7 full weekday-column headers without "…"
+        self.setMinimumWidth(280)
+
+    def sizeHint(self):
+        """Include the injected time row height in the reported size hint.
+
+        Qt's popup-creation code calls sizeHint() to determine the popup
+        container size.  Without this override the base class ignores the
+        injected widget, producing a clipped grid (last week hidden) and
+        truncated column headers.
+        """
+        from PySide6.QtCore import QSize
+        base = super().sizeHint()
+        return QSize(max(base.width(), 280), base.height() + self._TIME_ROW_H)
+
+    def minimumSizeHint(self):
+        from PySide6.QtCore import QSize
+        base = super().minimumSizeHint()
+        return QSize(max(base.width(), 280), base.height() + self._TIME_ROW_H)
+
     # ── Public helpers ────────────────────────────────────────────────────
 
     def get_time(self) -> QTime:
@@ -128,6 +166,18 @@ class _DateTimePickerEdit(QDateTimeEdit):
         # Sync embedded time widget to the current datetime before the popup appears
         self._cal.set_time(self.time())
         super().showPopup()
+        # Belt-and-suspenders: Qt may size the popup before our sizeHint()
+        # override is consulted on some platform/style combinations.  After
+        # the popup is open, check that its container is at least as large as
+        # the calendar's own sizeHint and expand it if not.
+        _popup = self._cal.parentWidget()
+        if _popup is not None:
+            _hint = self._cal.sizeHint()
+            _cur  = _popup.size()
+            _w = max(_cur.width(),  _hint.width())
+            _h = max(_cur.height(), _hint.height())
+            if _w != _cur.width() or _h != _cur.height():
+                _popup.resize(_w, _h)
 
     def _on_cal_time_changed(self, t: QTime) -> None:
         """Update time portion only, keeping the current date."""
@@ -721,6 +771,7 @@ class FilterDialog(QDialog):
         self._chk_time_enable.setChecked(False)
         self._chk_separately.setChecked(False)
         self._chk_date_exclude.setChecked(False)
+        self._chk_specific_day.setChecked(False)
         self._spn_days.setValue(0)
         self._spn_hours.setValue(0)
         self._chk_rel_exclude.setChecked(False)
@@ -742,6 +793,7 @@ class FilterDialog(QDialog):
                 json.dump(cfg, f, indent=2, ensure_ascii=False)
             QMessageBox.information(self, "Saved", f"Filter saved to:\n{path}")
         except Exception as e:
+            logger.exception("Failed to save filter preset to %s", path)
             QMessageBox.critical(self, "Error", f"Failed to save filter:\n{e}")
 
     def _load_preset(self) -> None:
@@ -770,6 +822,7 @@ class FilterDialog(QDialog):
         except (json.JSONDecodeError, ValueError) as e:
             QMessageBox.warning(self, "Invalid Preset", str(e))
         except Exception as e:
+            logger.exception("Failed to load filter preset from %s", path)
             QMessageBox.critical(self, "Error", f"Failed to load filter:\n{e}")
 
     # =====================================================================
@@ -781,12 +834,17 @@ class FilterDialog(QDialog):
         if not cfg:
             return
 
-        # Levels
+        # Levels — empty list means "all checked = no filter"; treat as check-all.
         levels = cfg.get("levels")
         if levels is not None:
-            level_set = set(levels)
-            for name, chk in self._level_checks.items():
-                chk.setChecked(name in level_set)
+            if not levels:
+                # Empty list = all checked (see get_filter_config() line 922-924)
+                for chk in self._level_checks.values():
+                    chk.setChecked(True)
+            else:
+                level_set = set(levels)
+                for name, chk in self._level_checks.items():
+                    chk.setChecked(name in level_set)
 
         # Source / Category / User / Computer
         self._inp_source.setText(", ".join(cfg.get("sources", [])))
@@ -820,6 +878,7 @@ class FilterDialog(QDialog):
         # Date/time
         self._chk_date_enable.setChecked(cfg.get("date_enabled", False))
         self._chk_time_enable.setChecked(cfg.get("time_enabled", False))
+        self._chk_separately.setChecked(cfg.get("separately_enabled", False))
         if cfg.get("date_from"):
             self._dt_from.setDateTime(QDateTime.fromString(cfg["date_from"], "yyyy-MM-dd HH:mm:ss"))
         if cfg.get("date_to"):
@@ -922,6 +981,7 @@ class FilterDialog(QDialog):
             # Date/time
             "date_enabled": self._chk_date_enable.isChecked(),
             "time_enabled": self._chk_time_enable.isChecked(),
+            "separately_enabled": self._chk_separately.isChecked(),
             "date_from": date_from,
             "date_to": date_to,
             "date_exclude": self._chk_date_exclude.isChecked(),
