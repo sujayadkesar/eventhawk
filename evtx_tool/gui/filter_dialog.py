@@ -399,13 +399,14 @@ class FilterDialog(QDialog):
         dt_row.addWidget(_lbl("From:"))
         self._dt_from = _DateTimePickerEdit()
         self._dt_from.setDisplayFormat("dd-MM-yyyy HH:mm:ss")
-        self._dt_from.setDateTime(QDateTime.currentDateTime().addYears(-1))
+        # Default time to 00:00:00 — user sets time explicitly via the "Time" checkbox
+        self._dt_from.setDateTime(QDateTime(QDateTime.currentDateTime().addYears(-1).date(), QTime(0, 0, 0)))
         self._dt_from.setEnabled(False)
         dt_row.addWidget(self._dt_from)
         dt_row.addWidget(_lbl("To:"))
         self._dt_to = _DateTimePickerEdit()
         self._dt_to.setDisplayFormat("dd-MM-yyyy HH:mm:ss")
-        self._dt_to.setDateTime(QDateTime.currentDateTime())
+        self._dt_to.setDateTime(QDateTime(QDateTime.currentDateTime().date(), QTime(0, 0, 0)))
         self._dt_to.setEnabled(False)
         dt_row.addWidget(self._dt_to)
         self._chk_date_exclude = QCheckBox("Exclude")
@@ -651,6 +652,12 @@ class FilterDialog(QDialog):
         enabled = self._chk_date_enable.isChecked() or self._chk_time_enable.isChecked()
         self._dt_from.setEnabled(enabled)
         self._dt_to.setEnabled(enabled)
+        # When Time checkbox is unchecked, reset time portion to 00:00:00 so
+        # a date-only filter does not accidentally carry over a stale time.
+        if not self._chk_time_enable.isChecked():
+            _zero = QTime(0, 0, 0)
+            self._dt_from.setTime(_zero)
+            self._dt_to.setTime(_zero)
 
     def _toggle_specific_day(self, checked: bool) -> None:
         self._de_specific_day.setEnabled(checked)

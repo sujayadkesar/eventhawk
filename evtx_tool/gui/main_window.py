@@ -25,7 +25,7 @@ from PySide6.QtCore import (
     QPropertyAnimation, QEasingCurve, QSettings, QFileSystemWatcher,
 )
 from PySide6.QtGui import (
-    QAction, QColor, QFont, QKeySequence, QIcon, QPixmap,
+    QAction, QColor, QFont, QKeySequence, QIcon, QPainter, QPixmap,
     QStandardItem, QStandardItemModel,
 )
 from PySide6.QtWidgets import (
@@ -220,12 +220,22 @@ class ColumnFilterPopup(QDialog):
 
     # Columns that support dropdown filtering  →  event-dict key
     FILTERABLE = {
-        1: "event_id",       # Event ID
-        2: "level_name",     # Level
-        4: "computer",       # Computer
-        5: "channel",        # Channel
-        6: "user_id",        # User
-        8: "source_file",    # Source File
+        1:  "event_id",        # Event ID
+        2:  "level_name",      # Level
+        3:  "timestamp_date",  # Timestamp — date-level grouping (YYYY-MM-DD)
+        4:  "computer",        # Computer
+        5:  "channel",         # Channel
+        6:  "user_id",         # User
+        8:  "source_file",     # Source File
+        # ── Extended columns ──────────────────────────────────────────────
+        9:  "keywords",        # Keywords
+        10: "opcode",          # Operational Code
+        11: "log",             # Log
+        12: "process_id",      # Process ID
+        13: "thread_id",       # Thread ID
+        15: "session_id",      # Session ID
+        19: "correlation_id",  # Correlation Id
+        21: "provider",        # Provider
     }
 
     def __init__(self, col_index: int, values: dict, parent=None):
@@ -376,6 +386,53 @@ class ColumnFilterPopup(QDialog):
         """Emit sortRequested and close the popup without changing filter state."""
         self.sortRequested.emit(self._col, order)
         self.accept()
+
+
+# ── Empty-table overlay ───────────────────────────────────────────────────────
+
+class _EventTableView(QTableView):
+    """QTableView that paints a centred 'No events' message when the model is
+    empty (e.g. after a filter yields 0 rows).  Works for both proxy-model and
+    direct-model usage because it simply checks rowCount() == 0."""
+
+    _OVERLAY_TEXT = "No events match the current filter"
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        super().paintEvent(event)
+        mdl = self.model()
+        if mdl is None or mdl.rowCount() > 0:
+            return
+
+        # Only show the overlay when data was actually loaded but every row was
+        # filtered away.  Without this guard the message also appears on the
+        # empty table shown at startup before any file is opened.
+        #
+        # • Proxy models (normal mode): source model has rows but proxy has 0.
+        # • Direct models (JM / ArrowTableModel): expose total_unfiltered_rows.
+        # If neither check is satisfiable we stay silent (safe default).
+        if hasattr(mdl, "sourceModel"):
+            src = mdl.sourceModel()
+            has_data = src is not None and src.rowCount() > 0
+        else:
+            has_data = bool(getattr(mdl, "total_unfiltered_rows", 0))
+        if not has_data:
+            return
+
+        painter = QPainter(self.viewport())
+        painter.save()
+        pen_color = self.palette().color(self.palette().ColorRole.PlaceholderText)
+        if not pen_color.isValid():
+            pen_color = QColor("#888888")
+        painter.setPen(pen_color)
+        font = painter.font()
+        font.setPointSize(max(font.pointSize() + 2, 13))
+        painter.setFont(font)
+        painter.drawText(
+            self.viewport().rect(),
+            Qt.AlignmentFlag.AlignCenter,
+            self._OVERLAY_TEXT,
+        )
+        painter.restore()
 
 
 # ── Per-file tab state ────────────────────────────────────────────────────────
@@ -1895,6 +1952,1057 @@ class _MissingRecordIdDialog(QDialog):
         root.addLayout(btn_row)
 
 
+# ── WiFi History Browser dialog ───────────────────────────────────────────────
+
+class _WifiHistoryDialog(QDialog):
+    """
+    Non-modal dialog listing WiFi connection/disconnection sessions parsed from
+    Microsoft-Windows-WLAN-AutoConfig/Operational events (EIDs 8001/8003/8004/
+    11001/11006).  Mirrors the _LogonSessionDialog architecture.
+    """
+
+    _WLAN_CHANNEL = "Microsoft-Windows-WLAN-AutoConfig/Operational"
+
+    _RELEVANT_EIDS = frozenset({8001, 8002, 8003, 8004, 11001, 11006})
+
+    _REASON_CODES: dict[int, str] = {
+        # ── 802.11 standard reason codes (IEEE 802.11-2020) ───────────────
+        0:  "Success / clean disconnect",
+        1:  "Unspecified failure",
+        2:  "Authentication timeout / previous auth no longer valid",
+        3:  "Deauthenticated — station left or is leaving",
+        4:  "Disassociated — inactivity timeout",
+        5:  "Disassociated — AP too busy / overloaded",
+        6:  "Class 2 frame received from unauthenticated station",
+        7:  "Class 3 frame received from unassociated station",
+        8:  "Disassociated — STA left or is leaving BSS",
+        9:  "Requesting STA is not authenticated",
+        10: "Disassociated — power capability element unacceptable",
+        11: "Disassociated — supported channels element unacceptable",
+        12: "Disassociated — BSS transition management",
+        13: "Invalid information element",
+        14: "MIC failure",
+        15: "4-Way handshake timeout",
+        16: "Group key handshake timeout",
+        17: "IE in 4-Way handshake differs from (re)assoc request",
+        18: "Invalid group cipher",
+        19: "Invalid pairwise cipher",
+        20: "Invalid AKMP (key management)",
+        21: "Unsupported RSNE version",
+        22: "Invalid RSNE capabilities field",
+        23: "802.1X authentication failed",
+        24: "Cipher suite rejected by security policy",
+        25: "TDLS direct-link teardown — peer unreachable",
+        26: "TDLS direct-link teardown — unspecified reason",
+        27: "Disassociated — SSP requested",
+        28: "No SSP roaming agreement",
+        29: "Requested service rejected — SSP cipher suite",
+        30: "Requested service not authorized",
+        31: "TS deleted — DLS teardown unreachable",
+        32: "DLS teardown — unspecified reason",
+        33: "Destination STA not present in DLS",
+        34: "Destination STA not QoS-capable",
+        35: "Disassociated — QoS listener timeout",
+        36: "Disassociated — QoS-related failure",
+        37: "Disassociated — insufficient QoS bandwidth",
+        38: "Disassociated — excessive frames not acknowledged",
+        39: "Disassociated — STA transmitting outside TXOP limit",
+        40: "Peer STA requesting disconnect / BSS transition",
+        41: "Peer STA not responding (end of TXOP)",
+        42: "Peer STA declined addts request",
+        43: "Requested from peer — DLS",
+        44: "STA does not support requested bandwidth",
+        45: "SME cancels authentication exchange",
+        46: "Peer declined AddTS",
+        47: "Requested from peer (DLS teardown)",
+        48: "Mesh peering cancelled — no further reason",
+        49: "Mesh maximum number of peers reached",
+        50: "Mesh configuration policy violation",
+        51: "Mesh close received from peer",
+        52: "Mesh maximum retries exceeded — unable to confirm",
+        53: "Mesh confirm timeout",
+        54: "Mesh invalid GTK",
+        55: "Mesh inconsistent parameters",
+        56: "Mesh invalid security capability",
+        57: "Mesh path selection failure",
+        58: "No proxy information available (mesh)",
+        59: "Destination not reachable in mesh",
+        60: "MAC address already exists in MBSS",
+        61: "Mesh channel switch completed",
+        62: "Mesh channel switch failed",
+        # Extended/non-standard codes used by Windows drivers
+        65533: "Peer leaving",
+        65534: "Deauthentication frame received",
+        65535: "Association expired / lost",
+
+        # ── Windows WLAN API — auto-connect failure codes (0x41000+) ─────
+        # WLAN_REASON_CODE_CONNECT_BASE = 0x41000 = 266240
+        266241: "Profile not compatible with detected network",          # 0x41001
+        266242: "Network not compatible with profile settings",          # 0x41002
+        266243: "Profile specifies manual connection only",              # 0x41003
+        266244: "Network not visible / out of range",                    # 0x41004
+        266245: "Connection blocked by Group Policy",                    # 0x41005
+        266246: "Connection denied by user",                             # 0x41006
+        266247: "BSS type (infrastructure/ad-hoc) not allowed",          # 0x41007
+        266248: "Network is in the failed-connection list",              # 0x41008
+        266249: "Network is in the blocked-connection list",             # 0x41009
+        266250: "Preferred SSID list too long",                          # 0x4100A
+        266251: "WlanConnect call failed",                               # 0x4100B
+        266252: "WlanScan call failed",                                  # 0x4100C
+        266253: "Network not available (no BSS found)",                  # 0x4100D
+        266254: "Profile changed or deleted during connection attempt",  # 0x4100E
+        266255: "WEP key mismatch",                                      # 0x4100F
+        266256: "User did not respond to credentials prompt",            # 0x41010
+
+        # ── Windows WLAN API — MSMSEC profile validation (0x44000+) ─────
+        # WLAN_REASON_CODE_MSMSEC_CONNECT_BASE = 0x44000 = 278528
+        278528: "MSMSEC: Invalid WEP key index in profile",              # 0x44000
+        278529: "MSMSEC: PSK/passphrase present but not required",       # 0x44001
+        278530: "MSMSEC: WEP key length invalid",                        # 0x44002
+        278531: "MSMSEC: PSK/passphrase length invalid",                 # 0x44003
+        278532: "MSMSEC: No auth/cipher pair specified in profile",      # 0x44004
+        278533: "MSMSEC: Too many auth/cipher pairs in profile",         # 0x44005
+        278534: "MSMSEC: Duplicate auth/cipher pair in profile",         # 0x44006
+        278535: "MSMSEC: Profile raw data is invalid",                   # 0x44007
+        278536: "MSMSEC: Invalid auth/cipher combination in profile",    # 0x44008
+        278537: "MSMSEC: 802.1X enabled in profile but AP uses PSK",     # 0x44009
+        278538: "MSMSEC: FIPS required but not supported by driver",     # 0x4400A
+        278539: "MSMSEC: Profile requires key mapping but none found",   # 0x4400B
+        278540: "MSMSEC: CSP does not support requested credentials",    # 0x4400C
+
+        # ── Windows WLAN API — MSMSEC runtime/security failure (0x45000+)
+        # WLAN_REASON_CODE_MSMSEC_DISCONNECT_BASE = 0x45000 = 282624
+        282624: "MSMSEC: Security capability mismatch with AP",          # 0x45000
+        282625: "MSMSEC: Security capability mismatch with profile",     # 0x45001
+        282626: "MSMSEC: 802.1X authentication failed at runtime",       # 0x45002
+        282627: "MSMSEC: IHV reported security capability mismatch",     # 0x45003
+        282628: "MSMSEC: Security downgrade attempt detected",           # 0x45004
+        282629: "MSMSEC: Authenticator reported failure",                # 0x45005
+        282630: "MSMSEC: 802.1X UI request failed",                      # 0x45006
+        282631: "MSMSEC: Crypto module failed to start",                 # 0x45007
+        282632: "MSMSEC: Crypto module reporting failure",               # 0x45008
+        282633: "MSMSEC: Key exchange failed",                           # 0x45009
+        282634: "MSMSEC: Failed to set unicast key",                     # 0x4500A
+        282635: "MSMSEC: Failed to set multicast/broadcast key",         # 0x4500B
+        282636: "MSMSEC: Message 1 of 4-way handshake timeout",          # 0x4500C
+        282637: "MSMSEC: Message 3 of 4-way handshake timeout",          # 0x4500D
+        282638: "MSMSEC: Message 1 of group key handshake timeout",      # 0x4500E
+        282639: "MSMSEC: Message 1 of group key handshake retry timeout",# 0x4500F
+        282640: "MSMSEC: EAPOL-Start timeout (no response from AP)",     # 0x45010
+        282641: "MSMSEC: Too many EAPOL-Start messages sent",            # 0x45011
+        282642: "MSMSEC: 802.1X protocol not supported by AP",           # 0x45012
+        282643: "MSMSEC: 802.1X module not available for auth",          # 0x45013
+    }
+
+    _OUI_TABLE: dict[str, str] = {
+        "00:50:F2": "Microsoft",        "00:1A:A2": "Cisco",          "04:BF:6D": "TP-Link",
+        "14:CC:20": "TP-Link",          "50:D4:F7": "TP-Link",        "A0:F3:C1": "TP-Link",
+        "00:1B:2F": "ASUS",             "10:BF:48": "ASUS",           "2C:FD:A1": "ASUS",
+        "00:24:D7": "Netgear",          "9C:3D:CF": "Netgear",        "A0:40:A0": "Netgear",
+        "00:17:F2": "Apple",            "00:1C:B3": "Apple",          "04:26:65": "Apple",
+        "7C:6D:62": "Apple",            "F8:FF:C2": "Apple",          "AC:BC:32": "Apple",
+        "00:23:14": "Intel",            "40:25:C2": "Intel",          "5C:51:4F": "Intel",
+        "7C:76:35": "Intel",            "8C:8D:28": "Intel",          "A4:C3:F0": "Qualcomm",
+        "00:90:4C": "Broadcom",         "00:15:6D": "Ubiquiti",       "04:18:D6": "Ubiquiti",
+        "F4:F5:D8": "Google",           "AC:63:BE": "Amazon",         "FC:A6:67": "Amazon",
+        "00:12:47": "Samsung",          "84:C9:B2": "Samsung",        "00:E0:4C": "Realtek",
+        "00:0B:86": "Aruba",            "20:4C:03": "Aruba",          "00:26:CB": "Cisco",
+        "00:40:96": "Cisco",            "70:70:8B": "Cisco",          "00:1A:30": "Cisco",
+        "00:1F:CA": "Cisco",            "00:22:90": "Cisco",          "E8:40:F2": "Cisco",
+        "00:26:99": "Cisco",            "18:33:9D": "Cisco",          "B4:DE:31": "Cisco",
+        "00:17:DF": "Ruckus",           "D4:68:4D": "Ruckus",         "00:24:39": "Motorola",
+        "00:60:B3": "Motorola",         "00:1B:77": "Dell",           "F8:B1:56": "Dell",
+        "00:21:9B": "Belkin",           "94:44:52": "Belkin",         "00:13:10": "Linksys",
+        "00:18:F8": "Linksys",          "00:14:BF": "Linksys",        "00:26:B9": "D-Link",
+        "C8:BE:19": "D-Link",           "1C:7E:E5": "D-Link",         "90:F6:52": "D-Link",
+        "00:E0:4B": "D-Link",           "14:D6:4D": "D-Link",         "28:10:7B": "D-Link",
+        "00:A0:C5": "ZyXEL",            "00:13:49": "ZyXEL",          "FC:F5:28": "ZyXEL",
+        "5C:63:BF": "Xiaomi",           "F4:8B:32": "Xiaomi",         "8C:BE:BE": "Xiaomi",
+        "10:2A:B3": "Huawei",           "54:89:98": "Huawei",         "04:F9:38": "Huawei",
+        "28:31:52": "Huawei",           "68:CC:6E": "Huawei",         "A0:08:6F": "Huawei",
+        "00:9A:CD": "Huawei",           "00:E0:FC": "Huawei",         "00:22:A1": "Motorola",
+        "00:24:E8": "Motorola",         "84:10:0D": "Motorola",       "00:1C:10": "Meru Networks",
+        "34:BD:C8": "HP",               "3C:D9:2B": "HP",             "9C:B6:54": "HP",
+        "00:26:55": "HP",               "1C:98:EC": "HP",             "18:A9:05": "Juniper",
+        "28:C0:DA": "Juniper",          "44:F4:77": "Juniper",        "00:05:85": "Juniper",
+        "2C:21:72": "Juniper",          "00:80:C8": "D-Link",         "00:0C:E6": "Meru Networks",
+    }
+
+    _SECURITY_GRADE_MAP: dict[str, str] = {
+        "sae":    "WPA3",
+        "owe":    "WPA3",
+        "wpa3":   "WPA3",
+        "rsna":   "WPA2",
+        "wpa2":   "WPA2",
+        "ccmp":   "WPA2",
+        "802.1x": "WPA2-ENT",
+        "wpa":    "WPA",
+        "tkip":   "WPA",
+        "wep":    "WEP",
+        "open":   "OPEN",
+    }
+
+    _HEADERS = [
+        "SSID", "BSSID", "Vendor", "Adapter",
+        "Connected", "Disconnected", "Duration",
+        "Security", "Band/Channel", "PHY",
+        "Disconnect Reason", "Flags",
+    ]
+
+    def __init__(self, events: list[dict], truncated: bool = False, parent=None):
+        super().__init__(parent)
+        self._all_sessions:   list[dict] = self._build_sessions(events)
+        self._shown_sessions: list[dict] = list(self._all_sessions)
+        # Carry provenance so summary and export can reflect incomplete datasets.
+        self._truncated: bool = truncated
+        self._build_ui()
+        self._apply_display_filters()
+
+    # ── Session building ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_ed(event: dict) -> dict[str, str]:
+        """Extract EventData fields — handles flat dict, list-of-Data, and #text shapes."""
+        ed_raw = event.get("event_data") or {}
+        if not isinstance(ed_raw, dict):
+            return {}
+        result: dict[str, str] = {}
+        # Shape A: flat key→value dict (already expanded)
+        if any(k not in ("Data", "#text") for k in ed_raw):
+            for k, v in ed_raw.items():
+                if not k.startswith("#") and not k.startswith("@"):
+                    result[k] = str(v or "")
+            return result
+        data = ed_raw.get("Data")
+        if data is None:
+            # Shape C fallback: top-level #text with "Key=Value\n" lines
+            raw_text = str(ed_raw.get("#text", ""))
+            for line in raw_text.splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    result[k.strip()] = v.strip()
+            return result
+        if isinstance(data, list):
+            for item in data:
+                if isinstance(item, dict):
+                    name = item.get("@Name", "")
+                    val  = item.get("#text", "")
+                    if name:
+                        result[str(name)] = str(val or "")
+            return result
+        if isinstance(data, dict):
+            name = data.get("@Name", "")
+            val  = data.get("#text", "")
+            if name:
+                result[str(name)] = str(val or "")
+            return result
+        if isinstance(data, str):
+            for line in data.splitlines():
+                if "=" in line:
+                    k, _, v = line.partition("=")
+                    result[k.strip()] = v.strip()
+        return result
+
+    @staticmethod
+    def _norm_iface(raw: str) -> str:
+        return raw.strip("{}").lower().strip()
+
+    @staticmethod
+    def _norm_bssid(raw: str) -> str:
+        return raw.upper().replace("-", ":").strip()
+
+    @staticmethod
+    def _lookup_oui(bssid: str) -> str:
+        parts = bssid.split(":")
+        if len(parts) < 3:
+            return "Unknown"
+        oui = ":".join(parts[:3]).upper()
+        return _WifiHistoryDialog._OUI_TABLE.get(oui, "Unknown")
+
+    @staticmethod
+    def _derive_security(auth: str, cipher: str) -> str:
+        a = (auth + " " + cipher).lower().replace("-", "").replace("_", "")
+        for key, grade in _WifiHistoryDialog._SECURITY_GRADE_MAP.items():
+            if key in a:
+                return grade
+        if not auth and not cipher:
+            return "Unknown"
+        return "Unknown"
+
+    @staticmethod
+    def _derive_band(channel: int) -> str:
+        if channel == 0:
+            return "Unknown"
+        if 1 <= channel <= 14:
+            return "2.4 GHz"
+        if channel in {
+            36, 40, 44, 48, 52, 56, 60, 64, 100, 104, 108, 112, 116, 120,
+            124, 128, 132, 136, 140, 144, 149, 153, 157, 161, 165, 169, 173, 177,
+        }:
+            return "5 GHz"
+        return "5/6 GHz"
+
+    @staticmethod
+    def _phy_label(phy_raw: str) -> str:
+        _MAP = {
+            "1": "FHSS",          "2": "DSSS (802.11b)",   "3": "IR",
+            "4": "OFDM (802.11a)", "5": "HR-DSSS (802.11b+)", "6": "ERP (802.11g)",
+            "7": "802.11n (HT)",  "8": "802.11ac (VHT)",   "9": "DMG (802.11ad)",
+            "10": "802.11ax (HE/WiFi 6)", "11": "802.11be (EHT/WiFi 7)",
+            "dsss": "DSSS (802.11b)", "ofdm": "OFDM (802.11a)", "hrdsss": "HR-DSSS (802.11b+)",
+            "erp": "ERP (802.11g)", "ht": "802.11n (HT)", "vht": "802.11ac (VHT)",
+            "he": "802.11ax (HE/WiFi 6)", "eht": "802.11be (EHT/WiFi 7)",
+        }
+        return _MAP.get(str(phy_raw).lower(), str(phy_raw)) if phy_raw else ""
+
+    @staticmethod
+    def _calc_duration(ts_start: str, ts_end: str) -> tuple[str, float]:
+        """Returns (display_str, total_seconds). total_seconds=-1 on parse error.
+
+        Medium fix: negative durations are no longer silently flipped with abs().
+        A negative result means disconnect < connect (mis-pairing or clock skew);
+        the display label surfaces this as '⚠ Out-of-order' so it is visible in
+        the table and anomaly-flag logic instead of being hidden as a short session.
+        """
+        try:
+            fmt = "%Y-%m-%d %H:%M:%S"
+            def _norm(ts: str) -> str:
+                return ts.rstrip("Z").replace("T", " ").split(".")[0][:19]
+            td    = datetime.strptime(_norm(ts_end), fmt) - datetime.strptime(_norm(ts_start), fmt)
+            total = td.total_seconds()
+            if total < 0:
+                return "⚠ Out-of-order", -1.0
+            h, rem = divmod(int(total), 3600)
+            m, sec = divmod(rem, 60)
+            if h > 0:
+                return f"{h}h {m:02d}m {sec:02d}s", total
+            if m > 0:
+                return f"{m}m {sec:02d}s", total
+            return f"{sec}s", total
+        except Exception:
+            return "?", -1.0
+
+    @staticmethod
+    def _norm_ts(raw_ts: object) -> str:
+        ts = str(raw_ts or "").strip()
+        if not ts:
+            return ""
+        return ts.rstrip("Z").replace("T", " ").split(".")[0][:19]
+
+    @staticmethod
+    def _decode_reason(code: int) -> str:
+        """Decode a WLAN disconnect/failure reason code to a human-readable string.
+
+        Covers:
+          - 802.11 standard codes (0–65535)
+          - Windows WLAN API codes (0x41000–0x45xxx)
+          - Unknown Windows codes: hex value + range description
+        """
+        if code == 0:
+            return ""
+        known = _WifiHistoryDialog._REASON_CODES.get(code)
+        if known:
+            return known
+        # For unknown Windows WLAN API codes, show hex + range label so the
+        # raw decimal (e.g. 294932) is at least identifiable at a glance.
+        if code > 0xFFFF:
+            h = f"0x{code:X}"
+            if   0x41000 <= code <= 0x41FFF:  area = "WLAN auto-connect failure"
+            elif 0x42000 <= code <= 0x42FFF:  area = "WLAN disconnect"
+            elif 0x43000 <= code <= 0x43FFF:  area = "MSMSEC general"
+            elif 0x44000 <= code <= 0x44FFF:  area = "MSMSEC profile validation"
+            elif 0x45000 <= code <= 0x45FFF:  area = "MSMSEC security runtime"
+            elif 0x46000 <= code <= 0x46FFF:  area = "WLAN IHV connect"
+            elif 0x47000 <= code <= 0x47FFF:  area = "WLAN IHV security"
+            elif 0x48000 <= code <= 0x4FFFF:  area = "WLAN driver/extended"
+            elif code == 0xFFFF0000:           return "Unknown WLAN reason"
+            else:                              area = "Windows WLAN API"
+            return f"{area} ({h})"
+        return f"Code {code}"
+
+    @staticmethod
+    def _build_sessions(events: list[dict]) -> list[dict]:
+        """
+        Single-pass WLAN event filter → sort → pair 8001↔8003 by InterfaceGuid.
+        Orphan 8001s (still connected) are included with disconnect_ts="".
+        Channel/PHY backfilled from nearest 11001 within 30 s.
+        """
+        WLAN_CH = _WifiHistoryDialog._WLAN_CHANNEL
+        REL     = _WifiHistoryDialog._RELEVANT_EIDS
+        _ex     = _WifiHistoryDialog._extract_ed
+        _ni     = _WifiHistoryDialog._norm_iface
+        _nb     = _WifiHistoryDialog._norm_bssid
+        _nts    = _WifiHistoryDialog._norm_ts
+
+        # Collect and categorise WLAN events
+        connect_ev:   list[dict] = []
+        disco_ev:     list[dict] = []
+        assoc_ev:     list[dict] = []   # EID 11001 — channel / PHY
+        auth_fail_ev: list[dict] = []   # EID 11006
+
+        for ev in events:
+            ch = str(ev.get("channel") or ev.get("Channel") or "")
+            # Low/Medium fix: use exact equality instead of substring containment.
+            # The old "ch not in WLAN_CH" let any short prefix like "Microsoft"
+            # slip through because it IS a substring of the full channel name.
+            # Exact match (case-insensitive) is both safer and faster.
+            if ch.lower() != WLAN_CH.lower():
+                continue
+            try:
+                eid = int(ev.get("event_id") or ev.get("EventID") or 0)
+            except (ValueError, TypeError):
+                eid = 0
+            if eid not in REL:
+                continue
+            ed = _ex(ev)
+            ts = _nts(ev.get("timestamp") or ev.get("Timestamp") or ev.get("TimeCreated") or "")
+            # Medium/High fix: use source_file as fallback when computer is blank
+            # so events from different EVTX files are still separated even if the
+            # Computer field is absent.  When both are empty we accept the residual
+            # limitation — events genuinely share the ("", iface) namespace.
+            computer = str(
+                ev.get("computer") or ev.get("Computer") or
+                ev.get("source_file") or ev.get("SourceFile") or ""
+            ).lower()
+            entry = {"eid": eid, "ts": ts, "ed": ed, "computer": computer}
+
+            if eid in (8001, 8004):
+                connect_ev.append(entry)
+            elif eid in (8002, 8003):
+                disco_ev.append(entry)
+            elif eid == 11001:
+                assoc_ev.append(entry)
+            elif eid == 11006:
+                auth_fail_ev.append(entry)
+
+        if not connect_ev and not disco_ev:
+            return []
+
+        # Pair connects with disconnects in chronological order per interface.
+        # Key: (computer, iface) so events from different hosts in merged datasets
+        # are never paired together, even if they share the same InterfaceGuid.
+        all_conn_disco = sorted(connect_ev + disco_ev, key=lambda x: x["ts"])
+
+        # pending: (computer, iface) → list[open session dict] (FIFO)
+        pending: dict[tuple, list[dict]] = {}
+        sessions: list[dict] = []
+        _missing_ctr = 0   # synthetic key counter for events with no InterfaceGuid
+
+        for w in all_conn_disco:
+            eid      = w["eid"]
+            ed       = w["ed"]
+            ts       = w["ts"]
+            computer = w["computer"]
+
+            iface_raw = ed.get("InterfaceGuid", "") or ed.get("InterfaceGUID", "")
+            iface     = _ni(iface_raw)
+            # High fix: empty InterfaceGuid must not share a bucket — events
+            # with no GUID cannot be reliably paired, so give each a unique
+            # synthetic key so they don't accidentally collide.
+            if not iface:
+                _missing_ctr += 1
+                iface = f"__no_guid_{_missing_ctr}__"
+            pkey = (computer, iface)
+
+            if eid in (8001, 8004):
+                ssid    = (ed.get("ProfileName") or ed.get("SSIDString")
+                           or ed.get("SSID") or "(hidden)")
+                bssid   = _nb(ed.get("BSSID") or ed.get("bssid") or "")
+                auth    = ed.get("AuthenticationAlgorithm", "") or ed.get("Authentication", "")
+                cipher  = ed.get("CipherAlgorithm", "") or ed.get("Cipher", "")
+                adapter = ed.get("InterfaceDescription", "") or ed.get("Interface", "")
+                sess = {
+                    "ssid":              ssid,
+                    "bssid":             bssid,
+                    "oui_vendor":        _WifiHistoryDialog._lookup_oui(bssid) if bssid else "Unknown",
+                    "adapter":           adapter,
+                    "interface_guid":    iface,
+                    # Low fix: carry computer into session so 11001/11006
+                    # enrichment can constrain by host in merged datasets.
+                    "computer":          computer,
+                    "connect_ts":        ts,
+                    "disconnect_ts":     "",
+                    "duration":          "Active",
+                    "duration_secs":     -1.0,
+                    "auth":              auth,
+                    "cipher":            cipher,
+                    "security_grade":    _WifiHistoryDialog._derive_security(auth, cipher),
+                    "channel":           0,
+                    "frequency_band":    "Unknown",
+                    "phy_label":         "",
+                    "disconnect_reason": "",
+                    "auth_failures":     0,
+                    "connect_eid":       eid,
+                    "anomaly_flags":     [],
+                }
+                pending.setdefault(pkey, []).append(sess)
+
+            elif eid in (8002, 8003):
+                open_list = pending.get(pkey, [])
+                if open_list:
+                    sess = open_list.pop(0)
+                    if not open_list:
+                        del pending[pkey]
+                    reason_raw = ed.get("ReasonCode", "") or ed.get("Reason", "")
+                    try:
+                        reason_int = int(reason_raw, 0) if reason_raw else 0
+                    except (ValueError, TypeError):
+                        reason_int = 0
+                    reason_str = _WifiHistoryDialog._decode_reason(reason_int)
+                    dur_label, dur_secs    = _WifiHistoryDialog._calc_duration(sess["connect_ts"], ts)
+                    sess["disconnect_ts"]  = ts
+                    sess["duration"]       = dur_label
+                    sess["duration_secs"]  = dur_secs
+                    sess["disconnect_reason"] = reason_str
+                    sessions.append(sess)
+                # Orphaned disconnect (no matching connect) — skip
+
+        # Remaining pending sessions = still connected (no disconnect recorded).
+        # Medium fix: EID 8004 events are connection *attempts* that failed —
+        # they never produced a real connection, so if no disconnect paired them
+        # they must not appear as "Active".  Mark them "Failed (no close)" so
+        # they are visually distinct from genuinely active sessions.
+        for iface_list in pending.values():
+            for s in iface_list:
+                if s["connect_eid"] == 8004 and not s["disconnect_ts"]:
+                    s["duration"] = "Failed (no close)"
+            sessions.extend(iface_list)
+
+        # Backfill channel / PHY from nearest EID 11001 on same interface (within 30 s).
+        # High fix: also constrain by computer so enrichment never leaks across
+        # hosts in a merged dataset.  BSSID guard prevents roam-neighbour bleed.
+        for sess in sessions:
+            iface    = sess["interface_guid"]
+            computer = sess["computer"]
+            conn_ts  = sess["connect_ts"]
+            best:       dict | None = None
+            best_delta: float       = 1e18
+            for a in assoc_ev:
+                # Host-scope guard: skip if both sides have a computer name and they differ
+                if computer and a["computer"] and a["computer"] != computer:
+                    continue
+                a_iface = _ni(a["ed"].get("InterfaceGuid", "") or a["ed"].get("InterfaceGUID", ""))
+                if a_iface != iface:
+                    continue
+                # Medium fix: skip if BSSIDs are both known but differ
+                a_bssid = _nb(a["ed"].get("BSSID") or "")
+                if a_bssid and sess["bssid"] and a_bssid != sess["bssid"]:
+                    continue
+                try:
+                    fmt    = "%Y-%m-%d %H:%M:%S"
+                    a_dt   = datetime.strptime(a["ts"], fmt)
+                    c_dt   = datetime.strptime(conn_ts, fmt)
+                    delta  = abs((a_dt - c_dt).total_seconds())
+                    if delta < best_delta:
+                        best_delta = delta
+                        best = a
+                except Exception:
+                    pass
+            if best and best_delta < 30:
+                aed = best["ed"]
+                try:
+                    ch = int(aed.get("Channel", 0) or 0)
+                except (ValueError, TypeError):
+                    ch = 0
+                phy_raw = str(aed.get("PHYType", "") or aed.get("PhyType", ""))
+                sess["channel"]        = ch
+                sess["frequency_band"] = _WifiHistoryDialog._derive_band(ch)
+                sess["phy_label"]      = _WifiHistoryDialog._phy_label(phy_raw)
+                if not sess["bssid"] and aed.get("BSSID"):
+                    bssid              = _nb(aed["BSSID"])
+                    sess["bssid"]      = bssid
+                    sess["oui_vendor"] = _WifiHistoryDialog._lookup_oui(bssid)
+
+        # Attach EID 11006 auth-failure counts per session window.
+        # High fix: constrain by computer to prevent cross-host leakage.
+        # Medium fix: also constrain by ProfileName/SSID when both sides have it
+        # so failures from a neighbouring network on the same adapter are excluded.
+        for sess in sessions:
+            iface    = sess["interface_guid"]
+            computer = sess["computer"]
+            conn_ts  = sess["connect_ts"]
+            disc_ts  = sess["disconnect_ts"] or "9999-12-31 23:59:59"
+            count    = 0
+            for af in auth_fail_ev:
+                # Host-scope guard
+                if computer and af["computer"] and af["computer"] != computer:
+                    continue
+                af_iface = _ni(af["ed"].get("InterfaceGuid", "") or af["ed"].get("InterfaceGUID", ""))
+                if af_iface != iface or not (conn_ts <= af["ts"] <= disc_ts):
+                    continue
+                af_ssid = af["ed"].get("ProfileName") or af["ed"].get("SSID") or ""
+                if af_ssid and sess["ssid"] and af_ssid.lower() != sess["ssid"].lower():
+                    continue
+                count += 1
+            sess["auth_failures"] = count
+
+        # Compute anomaly flags
+        for sess in sessions:
+            flags: list[str] = []
+            if sess["connect_eid"] == 8004:
+                flags.append("FAILED_ATTEMPT")  # Medium fix: surface 8004 as anomaly
+            if sess["security_grade"] == "OPEN":
+                flags.append("OPEN")
+            elif sess["security_grade"] == "WEP":
+                flags.append("WEP")
+            if sess["duration_secs"] >= 0 and sess["duration_secs"] < 60 and sess["disconnect_ts"]:
+                flags.append("SHORT_SESSION")
+            if sess["auth_failures"] > 0:
+                flags.append("AUTH_FAILURES")
+            if sess["connect_ts"]:
+                try:
+                    if int(sess["connect_ts"][11:13]) in {1, 2, 3, 4, 5}:
+                        flags.append("UNUSUAL_HOURS")
+                except Exception:
+                    pass
+            sess["anomaly_flags"] = flags
+
+        # Deduplicate — Windows occasionally logs EID 8001 twice for the same
+        # connection (adapter + profile manager), producing two identical pending
+        # entries that both get paired with a disconnect → duplicate rows.
+        # Key: (interface_guid, ssid, bssid, connect_ts, disconnect_ts).
+        # bssid is included so two legitimate sessions to the same SSID on
+        # different APs at the same timestamp are not collapsed.  Synthetic
+        # __no_guid_N__ keys are intentionally unique and will never collapse.
+        seen:    set[tuple] = set()
+        unique:  list[dict] = []
+        for s in sessions:
+            key = (s["interface_guid"], s["ssid"], s["bssid"],
+                   s["connect_ts"], s["disconnect_ts"])
+            if key not in seen:
+                seen.add(key)
+                unique.append(s)
+        sessions = unique
+
+        # Sort: most recent connect first
+        sessions.sort(key=lambda s: s["connect_ts"], reverse=True)
+        return sessions
+
+    # ── UI construction ───────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        self.setWindowTitle("WiFi History Browser")
+        self.setMinimumSize(1200, 540)
+        self.resize(1400, 640)
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowMinMaxButtonsHint |
+            Qt.WindowType.WindowCloseButtonHint
+        )
+
+        self.setPalette(EventTimeZoneDialog._make_light_palette())
+        self.setStyleSheet(
+            EventTimeZoneDialog._LIGHT_QSS + """
+            QTableWidget {
+                background: #faf7f2;
+                color: #1e1a14;
+                border: 1px solid #c4bba8;
+                gridline-color: #e0d8cc;
+                font-size: 8.5pt;
+                alternate-background-color: #f3ede3;
+            }
+            QTableWidget::item:selected {
+                background: #7a5c1e;
+                color: white;
+            }
+            QHeaderView::section {
+                background: #ede8df;
+                color: #3a2a10;
+                border: 1px solid #c4bba8;
+                padding: 3px 6px;
+                font-size: 8pt;
+                font-weight: bold;
+            }
+            QLineEdit {
+                background: #faf7f2;
+                border: 1px solid #c4bba8;
+                border-radius: 3px;
+                padding: 3px 6px;
+                font-size: 9pt;
+            }
+        """)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(14, 12, 14, 10)
+        root.setSpacing(8)
+
+        # ── Summary label (filled by _apply_display_filters on first render) ──
+        self._lbl_summary = QLabel()
+        self._lbl_summary.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_summary.setStyleSheet("padding:4px 0; font-size:9pt; background:transparent;")
+        root.addWidget(self._lbl_summary)
+
+        # ── Search bar + display toggles ──────────────────────────────────
+        search_row = QHBoxLayout()
+        search_row.addWidget(QLabel("Search:"))
+        self._search_edit = QLineEdit()
+        self._search_edit.setPlaceholderText("Filter by SSID, BSSID, adapter, or vendor…")
+        self._search_edit.textChanged.connect(self._apply_display_filters)
+        search_row.addWidget(self._search_edit, stretch=1)
+
+        self._chk_hide_failed = QCheckBox("Hide failed connections")
+        self._chk_hide_failed.setToolTip("Remove EID 8004 (connection failed) rows")
+        self._chk_hide_failed.toggled.connect(self._apply_display_filters)
+        search_row.addWidget(self._chk_hide_failed)
+
+        # Only show "Hide open networks" when open nets are present
+        has_open = any(s["security_grade"] == "OPEN" for s in self._all_sessions)
+        self._chk_hide_open = QCheckBox("Hide open networks")
+        self._chk_hide_open.setToolTip("Remove unencrypted (OPEN) networks from the table")
+        self._chk_hide_open.toggled.connect(self._apply_display_filters)
+        self._chk_hide_open.setVisible(has_open)
+        search_row.addWidget(self._chk_hide_open)
+
+        root.addLayout(search_row)
+
+        # ── Table ─────────────────────────────────────────────────────────
+        self._tbl = QTableWidget(0, len(self._HEADERS))
+        self._tbl.setHorizontalHeaderLabels(self._HEADERS)
+        self._tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._tbl.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._tbl.setSortingEnabled(True)
+        self._tbl.setAlternatingRowColors(True)
+        self._tbl.verticalHeader().setVisible(False)
+        self._tbl.verticalHeader().setDefaultSectionSize(22)
+
+        hdr = self._tbl.horizontalHeader()
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        hdr.setStretchLastSection(False)
+        # SSID, BSSID, Vendor, Adapter, Connected, Disconnected, Duration,
+        # Security, Band/Channel, PHY, Disconnect Reason, Flags
+        for i, w in enumerate([140, 145, 90, 160, 140, 140, 75, 75, 90, 90, 200, 120]):
+            self._tbl.setColumnWidth(i, w)
+
+        self._tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tbl.customContextMenuRequested.connect(self._on_context_menu)
+        root.addWidget(self._tbl)
+
+        # ── Buttons ───────────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+
+        btn_export = QPushButton("Export CSV")
+        btn_export.setToolTip("Export currently-filtered sessions to a CSV file")
+        btn_export.clicked.connect(self._on_export_csv)
+        btn_row.addWidget(btn_export)
+
+        btn_row.addStretch()
+
+        btn_close = QPushButton("Close")
+        btn_close.clicked.connect(self.close)
+        btn_row.addWidget(btn_close)
+
+        root.addLayout(btn_row)
+
+    # ── Table population ──────────────────────────────────────────────────
+
+    def _populate_table(self, sessions: list[dict]) -> None:
+        self._tbl.setSortingEnabled(False)
+        self._tbl.setRowCount(len(sessions))
+
+        col_failed   = QColor("#fde8e0")   # pale red   — EID 8004 failed
+        col_authfail = QColor("#fff8dc")   # pale yellow — auth failures
+        col_open     = QColor("#fff3cd")   # amber      — open network
+        col_active   = QColor("#edf7ed")   # pale green — still connected
+
+        for row, s in enumerate(sessions):
+            if s["connect_eid"] == 8004:
+                row_bg = col_failed
+            elif s["security_grade"] == "OPEN":
+                row_bg = col_open
+            elif s["auth_failures"] > 0:
+                row_bg = col_authfail
+            elif not s["disconnect_ts"]:
+                row_bg = col_active
+            else:
+                row_bg = None
+
+            band_ch = (
+                f"{s['frequency_band']} / Ch.{s['channel']}"
+                if s["channel"] else s["frequency_band"]
+            )
+
+            cells = [
+                s["ssid"],
+                s["bssid"],
+                s["oui_vendor"],
+                s["adapter"],
+                s["connect_ts"],
+                s["disconnect_ts"] if s["disconnect_ts"] else "Active",
+                s["duration"],
+                s["security_grade"],
+                band_ch,
+                s["phy_label"],
+                s["disconnect_reason"],
+                ", ".join(s["anomaly_flags"]),
+            ]
+
+            for col, text in enumerate(cells):
+                item = _DurationItem(text) if col == 6 else QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+                item.setData(Qt.ItemDataRole.UserRole, row)
+                if row_bg is not None:
+                    item.setBackground(row_bg)
+                self._tbl.setItem(row, col, item)
+
+        self._tbl.setSortingEnabled(True)
+        self._shown_sessions = sessions
+
+    # ── Filtering / summary ───────────────────────────────────────────────
+
+    def _apply_display_filters(self, *_) -> None:
+        t           = self._search_edit.text().strip().lower()
+        hide_failed = self._chk_hide_failed.isChecked()
+        hide_open   = self._chk_hide_open.isChecked()
+        sessions    = self._all_sessions
+
+        if hide_failed:
+            sessions = [s for s in sessions if s["connect_eid"] == 8001]
+        if hide_open:
+            sessions = [s for s in sessions if s["security_grade"] != "OPEN"]
+        if t:
+            sessions = [
+                s for s in sessions
+                if t in s["ssid"].lower()
+                or t in s["bssid"].lower()
+                or t in s["adapter"].lower()
+                or t in s["oui_vendor"].lower()
+            ]
+        self._populate_table(sessions)
+        self._update_summary(sessions)
+
+    def _update_summary(self, sessions: list[dict]) -> None:
+        total  = len(sessions)
+        ssids  = len({s["ssid"] for s in sessions})
+        active = sum(1 for s in sessions if not s["disconnect_ts"])
+        open_n = sum(1 for s in sessions if s["security_grade"] == "OPEN")
+        parts  = [
+            f"<b>{total}</b> session(s)",
+            f"<b>{ssids}</b> unique network(s)",
+        ]
+        if active:
+            parts.append(f"<b>{active}</b> active (no disconnect recorded)")
+        if open_n:
+            parts.append(
+                f"<span style='color:#a01800;'>⚠ {open_n} open network(s) (no encryption)</span>"
+            )
+        # Provenance: surface incomplete-dataset state directly in the summary bar
+        # so the user never has to remember the earlier pop-up warning.
+        if self._truncated:
+            parts.append(
+                "<span style='color:#8a4800;'>⚠ Results capped at 200,000 events — "
+                "later sessions may be missing</span>"
+            )
+        self._lbl_summary.setText(" &nbsp;│&nbsp; ".join(parts))
+
+    # ── Context menu ──────────────────────────────────────────────────────
+
+    def _on_context_menu(self, pos) -> None:
+        from PySide6.QtWidgets import QMenu
+        from PySide6.QtGui     import QGuiApplication
+
+        index = self._tbl.indexAt(pos)
+        if not index.isValid():
+            return
+        self._tbl.selectRow(index.row())
+        # After column sorting QTableWidget physically reorders items, so the
+        # visual row index no longer matches insertion order.  UserRole stores
+        # the original index into _shown_sessions at populate time — use that
+        # instead of index.row() so we always read the correct session.
+        cell = self._tbl.item(index.row(), 0)
+        if cell is None:
+            return
+        orig_row = cell.data(Qt.ItemDataRole.UserRole)
+        if orig_row is None or not (0 <= orig_row < len(self._shown_sessions)):
+            return
+        s = self._shown_sessions[orig_row]
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background:#2b2b2b; color:#e8e8e8; border:1px solid #555; }"
+            "QMenu::item:selected { background:#4a6fa5; color:white; }"
+            "QMenu::separator { height:1px; background:#555; margin:4px 8px; }"
+        )
+
+        act_ssid = menu.addAction(f"\U0001f4cb  Copy SSID  ({s['ssid']})")
+        act_ssid.triggered.connect(lambda: QGuiApplication.clipboard().setText(s["ssid"]))
+
+        if s["bssid"]:
+            act_bssid = menu.addAction(f"\U0001f4cb  Copy BSSID  ({s['bssid']})")
+            act_bssid.triggered.connect(lambda: QGuiApplication.clipboard().setText(s["bssid"]))
+
+        if s["adapter"]:
+            act_adapt = menu.addAction(f"\U0001f4cb  Copy Adapter  ({s['adapter']})")
+            act_adapt.triggered.connect(lambda: QGuiApplication.clipboard().setText(s["adapter"]))
+
+        if s["auth_failures"] > 0:
+            menu.addSeparator()
+            act_af = menu.addAction(f"\u26a0  {s['auth_failures']} auth failure(s) in this session")
+            act_af.setEnabled(False)
+
+        menu.exec(self._tbl.viewport().mapToGlobal(pos))
+
+    # ── Export ────────────────────────────────────────────────────────────
+
+    def _on_export_csv(self) -> None:
+        import csv
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export WiFi History", "wifi_history.csv",
+            "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                # Provenance: note truncation in the file itself so the exported
+                # CSV is self-describing even when the dialog is long closed.
+                if self._truncated:
+                    writer.writerow([
+                        "NOTE: Dataset was capped at 200,000 events — "
+                        "sessions from later in the time range may be missing."
+                    ])
+                writer.writerow(self._HEADERS)
+                # Low fix: rebuild row order from the table's current visual state
+                # so an interactive column sort is reflected in the exported file.
+                ordered: list[dict] = []
+                for vis_row in range(self._tbl.rowCount()):
+                    cell = self._tbl.item(vis_row, 0)
+                    if cell is None:
+                        continue
+                    orig = cell.data(Qt.ItemDataRole.UserRole)
+                    if orig is not None and 0 <= orig < len(self._shown_sessions):
+                        ordered.append(self._shown_sessions[orig])
+                if not ordered:
+                    ordered = self._shown_sessions
+                for s in ordered:
+                    band_ch = (
+                        f"{s['frequency_band']} / Ch.{s['channel']}"
+                        if s["channel"] else s["frequency_band"]
+                    )
+                    writer.writerow([
+                        s["ssid"], s["bssid"], s["oui_vendor"], s["adapter"],
+                        s["connect_ts"], s["disconnect_ts"], s["duration"],
+                        s["security_grade"], band_ch, s["phy_label"],
+                        s["disconnect_reason"], ", ".join(s["anomaly_flags"]),
+                    ])
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", f"Could not write CSV:\n{exc}")
+            return
+        QMessageBox.information(
+            self, "Export Complete",
+            f"Saved {len(ordered)} session(s) to:\n{path}"
+        )
+
+
+# ── WiFi JM background fetch worker ──────────────────────────────────────────
+
+class _WifiJMFetchWorker(QThread):
+    """Query Parquet shards for WLAN-AutoConfig events on a background thread.
+
+    Prevents the UI from freezing on large shard sets — DuckDB parquet_scan()
+    over many files can take several seconds on spinning-disk hardware.
+
+    Emits ``finished(list)`` with the collected event dicts on success,
+    or ``fetch_error(str)`` with a human-readable message on failure.
+    (Signal is named ``fetch_error`` rather than ``error`` to avoid shadowing
+    the built-in QThread.error() that exists on some Qt versions.)
+    """
+
+    finished    = Signal(list, bool)  # (list[dict], was_truncated) — may be empty/False
+    fetch_error = Signal(str, str)    # (error_kind, detail_message)
+
+    _WLAN_CHANNEL = "Microsoft-Windows-WLAN-AutoConfig/Operational"
+    _RELEVANT_EIDS = (8001, 8002, 8003, 8004, 11001, 11006)
+
+    def __init__(self, parquet_dir: str, parent=None) -> None:
+        super().__init__(parent)
+        self._parquet_dir = parquet_dir
+
+    def run(self) -> None:
+        import json as _json
+        import os  as _os
+        import duckdb as _duckdb
+
+        manifest_path = _os.path.join(self._parquet_dir, "parquet_manifest.json")
+        # Structured manifest read — distinguish missing file from corrupt JSON
+        # from generic I/O errors so the UI can show a targeted message.
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as _f:
+                _raw_manifest = _f.read()
+        except FileNotFoundError:
+            logger.error("WiFi JM [manifest_missing]: %s", manifest_path)
+            self.fetch_error.emit(
+                "manifest_missing",
+                f"Parquet manifest not found:\n{manifest_path}\n\n"
+                "The dataset may have been moved or the JM session was not fully built.",
+            )
+            return
+        except OSError as exc:
+            logger.error("WiFi JM [manifest_read_error]: %s — %s", manifest_path, exc)
+            self.fetch_error.emit(
+                "manifest_read_error",
+                f"Cannot read Parquet manifest:\n{exc}",
+            )
+            return
+        try:
+            shards = _json.loads(_raw_manifest)
+        except _json.JSONDecodeError as exc:
+            logger.error("WiFi JM [manifest_parse_error]: %s — %s", manifest_path, exc)
+            self.fetch_error.emit(
+                "manifest_parse_error",
+                f"Parquet manifest is not valid JSON:\n{exc}",
+            )
+            return
+
+        if not shards:
+            self.finished.emit([], False)
+            return
+
+        eids_csv   = ", ".join(str(e) for e in self._RELEVANT_EIDS)
+        shard_list = (
+            "[" + ", ".join(f"'{p.replace(chr(39), chr(39)*2)}'" for p in shards) + "]"
+        )
+        try:
+            con = _duckdb.connect()
+            try:
+                # Low fix: fetch one extra row so we can detect truncation without
+                # false-positive warnings when the result count exactly equals the cap.
+                rows = con.execute(
+                    f"SELECT event_id, timestamp_utc, event_data_json "
+                    f"FROM parquet_scan({shard_list}) "
+                    f"WHERE channel = ? "
+                    f"  AND event_id IN ({eids_csv}) "
+                    f"ORDER BY timestamp_utc "
+                    f"LIMIT 200001",
+                    [self._WLAN_CHANNEL],
+                ).fetchall()
+            finally:
+                con.close()   # Low/Medium fix: guaranteed even on query exception
+        except Exception as exc:
+            logger.error("WiFi JM [duckdb_query_error]: %s", exc)
+            self.fetch_error.emit("duckdb_query_error", str(exc))
+            return
+
+        truncated = len(rows) > 200_000
+        if truncated:
+            rows = rows[:200_000]
+
+        events: list[dict] = []
+        for ev_id, ts_utc, ed_json in rows:
+            try:
+                ed = _json.loads(ed_json) if ed_json else {}
+            except Exception:
+                ed = {}
+            events.append({
+                "event_id":   ev_id,
+                "timestamp":  str(ts_utc or ""),
+                "event_data": ed,
+                "channel":    self._WLAN_CHANNEL,
+            })
+        self.finished.emit(events, truncated)
+
+
 # ── Add / Remove Columns dialog ───────────────────────────────────────────────
 
 class AddRemoveColumnsDialog(QDialog):
@@ -2528,6 +3636,10 @@ class MainWindow(QMainWindow):
         a.setToolTip("Browse all logon sessions, view durations and types, filter events to a session")
         a.triggered.connect(self._on_show_logon_sessions)
 
+        a = tm.addAction("WiFi History\u2026")
+        a.setToolTip("Browse WiFi connection/disconnection history from WLAN-AutoConfig events")
+        a.triggered.connect(self._on_show_wifi_history)
+
         tm.addSeparator()
         a = tm.addAction("Clear Results")
         a.triggered.connect(self._clear_results)
@@ -3126,9 +4238,9 @@ class MainWindow(QMainWindow):
 
     # ── Table factory (reused for merged + per-file tabs) ─────────────
 
-    def _create_configured_table(self, proxy: EventFilterProxyModel) -> QTableView:
+    def _create_configured_table(self, proxy: EventFilterProxyModel) -> _EventTableView:
         """Create and configure a QTableView with standard settings."""
-        table = QTableView()
+        table = _EventTableView()
         table.setModel(proxy)
         table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
@@ -4698,10 +5810,16 @@ class MainWindow(QMainWindow):
 
         if not self._active_events:
             return
-        # Run counting on a background thread — avoids blocking the main thread
-        # for large event lists (same async pattern as Juggernaut mode).
+        # Collect the events visible through ALL active filters (advanced, text,
+        # session, quick) while temporarily suspending the current column's own
+        # quick filter so the popup still shows all of that column's values.
+        # This is strictly more correct than the old cascade_filters approach,
+        # which only considered quick filters and missed advanced/text/session.
         from evtx_tool.gui.jm_col_worker import NormalColValueWorker
-        worker = NormalColValueWorker(self._active_events, col_key, parent=self)
+        visible_events = self._active_proxy.collect_source_events_for_popup(col_key)
+        if not visible_events:
+            return
+        worker = NormalColValueWorker(visible_events, col_key, parent=self)
         worker.finished.connect(
             lambda vals, idx=logical_index: (
                 self._show_col_filter_popup(idx, vals) if vals else None
@@ -4715,7 +5833,7 @@ class MainWindow(QMainWindow):
 
     def _start_col_value_worker(self, logical_index: int, col_key: str) -> None:
         """Start async ColValueWorker for Juggernaut Mode column filter popup."""
-        from evtx_tool.gui.jm_col_worker import ColValueWorker
+        from evtx_tool.gui.jm_col_worker import ColValueWorker, build_cascade_where
         if self._hw_model is None:
             return
         # If a per-file tab is active, scope GROUP BY to that file only.
@@ -4725,6 +5843,28 @@ class MainWindow(QMainWindow):
             where_sql, where_params = "source_file = ?", [active_fp]
         else:
             where_sql, where_params = None, None
+        # Cascading filter: build WHERE clause from active quick filters on the
+        # JM model, excluding the current column, so the popup only reflects the
+        # current view.
+        from evtx_tool.gui.heavyweight_model import ArrowTableModel as _ATM
+        _am      = self._active_table.model()
+        _jm_src  = _am if isinstance(_am, _ATM) else self._hw_model
+        cascade_sql, cascade_params = build_cascade_where(
+            col_key, _jm_src.get_quick_filters()
+        )
+        if cascade_sql and where_sql:
+            where_sql    = f"({where_sql}) AND ({cascade_sql})"
+            where_params = list(where_params or []) + cascade_params
+        elif cascade_sql:
+            where_sql, where_params = cascade_sql, cascade_params
+
+        # Also fold in the advanced-filter and session-filter WHERE so the
+        # popup counts reflect the full active view, not just quick filters.
+        base_sql, base_params = _jm_src.get_cascade_base_where()
+        if base_sql:
+            where_sql    = f"({where_sql}) AND ({base_sql})" if where_sql else base_sql
+            where_params = list(where_params or []) + base_params
+
         worker = ColValueWorker(
             self._hw_model._full_table, col_key,
             where_sql=where_sql, where_params=where_params,
@@ -4886,14 +6026,8 @@ class MainWindow(QMainWindow):
         """
         if self._hw_model is None:
             return {}
-        _COL_MAP = {
-            "event_id":    "CAST(event_id AS VARCHAR)",
-            "level_name":  "level_name",
-            "computer":    "computer",
-            "channel":     "channel",
-            "user_id":     "user_id",
-            "source_file": "source_file",
-        }
+        # Keep in sync with jm_col_worker._COL_MAP (same Arrow/DuckDB column names).
+        from evtx_tool.gui.jm_col_worker import _COL_MAP
         expr = _COL_MAP.get(col_key)
         if not expr:
             return {}
@@ -5627,18 +6761,34 @@ class MainWindow(QMainWindow):
         # Map proxy column to event dict key + display value
         col = index.column()
         col_key_map = {
-            0: None,                  # Row # — can't filter
-            1: 'event_id',
-            2: 'level_name',
-            3: 'timestamp',
-            4: 'computer',
-            5: 'channel',
-            6: 'user_id',
-            7: None,                  # ATT&CK — handled separately
-            8: 'source_file',
+            0:  None,                  # Row # — can't filter
+            1:  'event_id',
+            2:  'level_name',
+            3:  'timestamp_date',  # date-only quick filter (YYYY-MM-DD)
+            4:  'computer',
+            5:  'channel',
+            6:  'user_id',
+            7:  None,                  # ATT&CK — handled separately
+            8:  'source_file',
+            # ── Extended columns ──────────────────────────────────────────
+            9:  'keywords',
+            10: 'opcode',
+            11: 'log',
+            12: 'process_id',
+            13: 'thread_id',
+            14: 'processor_id',
+            15: 'session_id',
+            19: 'correlation_id',
+            20: 'record_id',
+            21: 'provider',
         }
         col_key = col_key_map.get(col)
         cell_val = index.data() or ""
+
+        # Timestamp quick filter uses date portion only (YYYY-MM-DD) so the
+        # popup groups by day and the filter is easy to read / match.
+        if col_key == "timestamp_date":
+            cell_val = cell_val[:10]
 
         menu = QMenu(self)
 
@@ -5778,6 +6928,116 @@ class MainWindow(QMainWindow):
             parent=self,
         )
         self._logon_sessions_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_show_wifi_history(self) -> None:
+        """Open the WiFi History Browser dialog (non-modal).
+
+        High-1 fix: the dialog is NEVER reused across calls — always close any
+        existing instance and build a fresh one so stale sessions are impossible
+        after a re-parse, file clear, or tab-context change.
+        """
+        # Always invalidate the previous dialog (don't serve stale sessions).
+        existing = getattr(self, "_wifi_history_dlg", None)
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass
+            self._wifi_history_dlg = None
+
+        if self._hw_model is not None:
+            # JM mode: run DuckDB parquet_scan on a background thread so the
+            # UI never freezes on large shard sets (Medium-4 fix).
+            parquet_dir = getattr(self, "_hw_db_path", None)
+            if not parquet_dir:
+                QMessageBox.information(self, "WiFi History",
+                                        "No Juggernaut dataset loaded.")
+                return
+            self._set_status("Fetching WiFi events…")
+            # Medium fix: monotonic request token.  If the user triggers multiple
+            # quick fetches, results from older workers are silently dropped so
+            # they cannot open a stale dialog after a newer request has finished.
+            self._wifi_jm_req_id = getattr(self, "_wifi_jm_req_id", 0) + 1
+            _req = self._wifi_jm_req_id
+
+            worker = _WifiJMFetchWorker(parquet_dir, parent=self)
+
+            def _on_ready(events, truncated, _r=_req):
+                if getattr(self, "_wifi_jm_req_id", None) != _r:
+                    return   # stale — a newer request already owns the slot
+                self._on_wifi_jm_events_ready(events, truncated)
+
+            def _on_err(kind, msg, _r=_req):
+                if getattr(self, "_wifi_jm_req_id", None) != _r:
+                    return
+                self._on_wifi_jm_fetch_error(kind, msg)
+
+            worker.finished.connect(_on_ready)
+            worker.fetch_error.connect(_on_err)
+            worker.start()
+            # Keep a reference so the worker is not GC'd before it finishes.
+            if not hasattr(self, "_wifi_jm_workers"):
+                self._wifi_jm_workers = []
+            self._wifi_jm_workers = [w for w in self._wifi_jm_workers
+                                     if w.isRunning()]
+            self._wifi_jm_workers.append(worker)
+            return
+
+        # Normal mode — events are already in memory, no cap applied.
+        events = self._active_events
+        if not events:
+            QMessageBox.information(self, "WiFi History", "No events loaded.")
+            return
+        self._open_wifi_history_dialog(events, truncated=False)
+
+    def _on_wifi_jm_events_ready(self, events: list, truncated: bool) -> None:
+        """Called (via closure) when _WifiJMFetchWorker finishes for the current request."""
+        self._set_status("")
+        if not events:
+            QMessageBox.information(self, "WiFi History",
+                                    "No WLAN-AutoConfig events found in the dataset.")
+            return
+        # Medium fix: warn only when the worker confirmed truncation (fetched > 200 000
+        # rows), not merely when the result count equals the cap exactly.
+        if truncated:
+            QMessageBox.warning(
+                self, "WiFi History — Results Truncated",
+                "The dataset contains more than 200,000 WLAN-AutoConfig events.\n"
+                "Results are limited to the first 200,000 (chronological order).\n"
+                "Some sessions near the end of the time range may be missing.",
+            )
+        self._open_wifi_history_dialog(events, truncated=truncated)
+
+    def _on_wifi_jm_fetch_error(self, kind: str, msg: str) -> None:
+        """Called (via closure) when _WifiJMFetchWorker encounters a classified error.
+
+        *kind* is a machine-readable tag emitted by the worker:
+          ``manifest_missing``    — parquet_manifest.json not found
+          ``manifest_read_error`` — I/O error reading the manifest
+          ``manifest_parse_error``— manifest is not valid JSON
+          ``duckdb_query_error``  — DuckDB parquet_scan / execute failure
+        """
+        self._set_status("")
+        _TITLES = {
+            "manifest_missing":     "Parquet Manifest Not Found",
+            "manifest_read_error":  "Cannot Read Parquet Manifest",
+            "manifest_parse_error": "Parquet Manifest Corrupt",
+            "duckdb_query_error":   "WiFi History Query Failed",
+        }
+        title = _TITLES.get(kind, "WiFi History Error")
+        QMessageBox.warning(self, title, msg)
+
+    def _open_wifi_history_dialog(self, events: list, truncated: bool = False) -> None:
+        """Create and show a fresh _WifiHistoryDialog from *events*.
+
+        *truncated* is forwarded into the dialog so the summary bar and CSV
+        export can carry provenance even after the one-shot warning is dismissed.
+        """
+        dlg = _WifiHistoryDialog(events=events, truncated=truncated, parent=self)
+        self._wifi_history_dlg = dlg
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -8254,15 +9514,43 @@ class MainWindow(QMainWindow):
     def _apply_tz_to_all_models(self) -> None:
         """
         1. Update the module-level tz config (affects apply_tz() everywhere).
-        2. Emit layoutChanged on every live EventTableModel so the table cells
+        2. Re-apply any active advanced filter so date bounds are recomputed in
+           the new timezone (set_advanced_filter reads _tz_state at call time).
+        3. Emit layoutChanged on every live EventTableModel so the table cells
            re-read COL_TS and re-render in the new timezone.
-        3. Re-render the detail panel for the currently selected row (if any).
+        4. Re-render the detail panel for the currently selected row (if any).
         """
         set_tz_config(
             self._tz_mode,
             self._tz_specific,
             self._tz_custom_offset_min,
         )
+
+        # Re-apply the active advanced filter now that _tz_state is updated.
+        # This recomputes _adv_date_from / _adv_date_to in the new timezone so
+        # a specific-day or date-range filter continues to match the dates the
+        # user sees in the table rather than drifting by a timezone offset.
+        _cfg = getattr(self, "_adv_filter_cfg", None)
+        if _cfg is not None:
+            if self._hw_model is not None:
+                try:
+                    self._hw_model.apply_filter(_cfg)
+                except Exception:
+                    pass
+            else:
+                # Merged-mode proxy
+                try:
+                    if self._proxy_model.has_advanced_filter():
+                        self._proxy_model.set_advanced_filter(_cfg)
+                except Exception:
+                    pass
+                # Per-file tab proxies (separate mode)
+                for _state in self._file_tabs.values():
+                    try:
+                        if _state.proxy.has_advanced_filter():
+                            _state.proxy.set_advanced_filter(_cfg)
+                    except Exception:
+                        pass
 
         # Refresh merged model
         self._event_model.layoutChanged.emit()

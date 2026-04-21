@@ -778,6 +778,42 @@ class ArrowTableModel(QAbstractTableModel):
             self._record_id_params    = []
             self._invalidate()
 
+    @property
+    def total_unfiltered_rows(self) -> int:
+        """Total rows in the dataset before any filter is applied."""
+        return len(self._full_table) if self._full_table is not None else 0
+
+    def get_cascade_base_where(self) -> "tuple[str, list]":
+        """Return the advanced-filter and session-filter WHERE clauses (excluding
+        quick filters and text search) as DuckDB-compatible SQL.
+
+        Used by ColValueWorker so cascade popup counts reflect ALL active view
+        filters, not just quick filters.
+
+        Known limitation — text search is intentionally omitted:
+        ``_text_where_sql`` uses ``CONTAINS(_ARROW_SEARCH_EXPR, ?)`` which is
+        evaluated against the pre-filtered Arrow ``_display_table``, not the
+        full ``_full_table`` that ColValueWorker queries.  Re-applying it in the
+        GROUP BY DuckDB query would double-filter against a different base table
+        and produce inconsistent counts.  Consequence: when text search is active
+        the popup values may include entries that text search would hide.  This
+        is a known, documented trade-off — fixing it requires passing the
+        already-filtered ``_display_table`` to ColValueWorker instead of
+        ``_full_table``, which is a separate architectural change.
+        """
+        parts:  list[str] = []
+        params: list      = []
+        for sql, p in (
+            (self._base_where_sql,      self._base_params),
+            (self._record_id_where_sql, self._record_id_params),
+        ):
+            if sql and sql != "1=1":
+                parts.append(f"({sql})")
+                params.extend(p)
+        if not parts:
+            return "", []
+        return " AND ".join(parts), params
+
     def apply_bookmark_filter(self, keys: "frozenset[tuple[str, int]]") -> None:
         """Filter to only bookmarked events using (source_file, record_id) composite key.
 
@@ -815,12 +851,31 @@ class ArrowTableModel(QAbstractTableModel):
     # ── Quick filters (right-click column filter) ─────────────────────────────
 
     _QUICK_KEY_TO_COL: dict[str, tuple[str, str]] = {
-        "event_id":    ("event_id",    "int"),
-        "level_name":  ("level_name",  "str"),
-        "computer":    ("computer",    "str"),
-        "channel":     ("channel",     "str"),
-        "user_id":     ("user_id",     "str"),
-        "source_file": ("source_file", "str"),
+        # ── Core columns ──────────────────────────────────────────────────────
+        "event_id":       ("event_id",                       "int"),
+        "level_name":     ("level_name",                     "str"),
+        "computer":       ("computer",                       "str"),
+        "channel":        ("channel",                        "str"),
+        "user_id":        ("user_id",                        "str"),
+        "source_file":    ("source_file",                    "str"),
+        # timestamp_utc is the actual SQLite column name (engine.py:49).
+        # SUBSTR(…,1,10) extracts the YYYY-MM-DD prefix from the ISO-8601 text.
+        "timestamp_date": ("SUBSTR(timestamp_utc, 1, 10)",   "str"),
+        # ── Extended columns ──────────────────────────────────────────────────
+        # These map to real columns in the SQLite events table.
+        "provider":       ("provider",                       "str"),
+        "keywords":       ("keywords",                       "str"),
+        # opcode is stored as int32; cast to TEXT so lower() + string compare works.
+        "opcode":         ("CAST(opcode AS TEXT)",           "str"),
+        # JM schema has no separate "log" column — channel is the display fallback.
+        "log":            ("channel",                        "str"),
+        # process_id / thread_id are int32; cast to TEXT for string compare.
+        "process_id":     ("CAST(process_id AS TEXT)",       "str"),
+        "thread_id":      ("CAST(thread_id AS TEXT)",        "str"),
+        "correlation_id": ("correlation_id",                 "str"),
+        # session_id and processor_id have no JM counterpart — omitted intentionally.
+        # record_id is int64 in the schema.
+        "record_id":      ("record_id",                      "int"),
     }
 
     def add_quick_filter(self, key: str, value: str, include: bool) -> None:

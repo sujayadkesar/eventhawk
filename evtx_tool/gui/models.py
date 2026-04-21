@@ -1156,13 +1156,31 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         # ── Layer 4: Quick filter (right-click context filters) ──────────────
         # Uses pre-built sets (_quick_excludes / _quick_includes) for O(1)
         # hash lookups instead of iterating the _quick_filters list per row.
+        #
+        # Virtual key semantics:
+        #   "timestamp_date" → display-timezone YYYY-MM-DD (via apply_tz), so
+        #       the filter matches the date the user actually sees in the table.
+        #   "log" → ev["log"] falling back to ev["channel"], matching COL_LOG
+        #       display logic in EventTableModel.data().
         if self._quick_excludes:
             for key, excl_set in self._quick_excludes.items():
-                if str(ev.get(key, "")).lower() in excl_set:
+                if key == "timestamp_date":
+                    ev_val = apply_tz(ev.get("timestamp", ""))[:10].lower()
+                elif key == "log":
+                    ev_val = str(ev.get("log") or ev.get("channel", "")).lower()
+                else:
+                    ev_val = str(ev.get(key, "")).lower()
+                if ev_val in excl_set:
                     return False
         if self._quick_includes:
             for key, incl_set in self._quick_includes.items():
-                if str(ev.get(key, "")).lower() not in incl_set:
+                if key == "timestamp_date":
+                    ev_val = apply_tz(ev.get("timestamp", ""))[:10].lower()
+                elif key == "log":
+                    ev_val = str(ev.get("log") or ev.get("channel", "")).lower()
+                else:
+                    ev_val = str(ev.get(key, "")).lower()
+                if ev_val not in incl_set:
                     return False
 
         # ── Layer 5: Session LogonId filter ──────────────────────────────────
@@ -1443,4 +1461,47 @@ class EventFilterProxyModel(QSortFilterProxyModel):
         if isinstance(src_model, EventTableModel):
             return src_model.get_event(src_index.row())
         return None
+
+    def collect_source_events_for_popup(self, exclude_qf_key: str) -> list:
+        """Return source event dicts that pass ALL active filters, with the
+        quick filter for *exclude_qf_key* temporarily suspended.
+
+        This gives cascade-accurate popup counts that respect advanced, text,
+        session, AND quick filters — minus the current column's own quick filter
+        so the popup still shows all of that column's possible values.
+
+        Operates entirely on the calling thread (no invalidateFilter call) so
+        the table does not flash.  The quick-exclude/include dicts are restored
+        in a ``finally`` block even if an exception occurs mid-scan.
+
+        Known limitation: for very large in-memory datasets (> 200 K events)
+        this scan can cause a brief pause before the background worker starts
+        counting.  Fixing it properly requires snapshotting all filter state
+        and re-running the full filter logic in the worker thread — a separate
+        architectural change outside the scope of this method.
+        """
+        src = self.sourceModel()
+        if not isinstance(src, EventTableModel):
+            return []
+
+        # Temporarily suspend the target column's quick-filter sets so that
+        # _filterAcceptsRow_impl treats those entries as absent.
+        saved_excl = self._quick_excludes
+        saved_incl = self._quick_includes
+        self._quick_excludes = {k: v for k, v in saved_excl.items()
+                                if k != exclude_qf_key}
+        self._quick_includes = {k: v for k, v in saved_incl.items()
+                                if k != exclude_qf_key}
+        events: list = []
+        mi = QModelIndex()
+        try:
+            for row in range(src.rowCount()):
+                if self._filterAcceptsRow_impl(row, mi):
+                    ev = src.get_event(row)
+                    if ev is not None:
+                        events.append(ev)
+        finally:
+            self._quick_excludes = saved_excl
+            self._quick_includes = saved_incl
+        return events
 
