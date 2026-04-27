@@ -761,6 +761,10 @@ class ArrowTableModel(QAbstractTableModel):
         self._invalidate()
 
     def apply_record_id_filter(self, ids: frozenset) -> None:
+        # M3 fix: do NOT zero _text_where_sql/_text_params here.
+        # Text search is independent state; clearing it on every record-id
+        # filter application makes active text searches silently disappear
+        # (and clearing the record-id filter can never restore them).
         if ids:
             ph = ",".join("?" * len(ids))
             self._record_id_where_sql = f"record_id IN ({ph})"
@@ -768,8 +772,6 @@ class ArrowTableModel(QAbstractTableModel):
         else:
             self._record_id_where_sql = ""
             self._record_id_params    = []
-        self._text_where_sql = ""
-        self._text_params    = []
         self._invalidate()
 
     def clear_record_id_filter(self) -> None:
@@ -819,6 +821,11 @@ class ArrowTableModel(QAbstractTableModel):
 
         Builds an OR chain so events with the same record_id from different files
         are correctly distinguished in merge / Juggernaut mode.
+
+        M3 fix: does NOT touch _text_where_sql/_text_params.  Text search is
+        independent state owned by apply_text_filter(); clobbering it here
+        causes active text searches to vanish when any bookmark/RA/logon-session
+        filter is applied, and they cannot be restored by clearing that filter.
         """
         if not keys:
             self.clear_record_id_filter()
@@ -830,8 +837,6 @@ class ArrowTableModel(QAbstractTableModel):
             params.extend([sf, rid])
         self._record_id_where_sql = " OR ".join(parts)
         self._record_id_params    = params
-        self._text_where_sql = ""
-        self._text_params    = []
         self._invalidate()
 
     def _get_shard_paths(self) -> list:

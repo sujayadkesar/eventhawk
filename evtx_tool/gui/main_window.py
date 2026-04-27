@@ -3003,6 +3003,1140 @@ class _WifiJMFetchWorker(QThread):
         self.finished.emit(events, truncated)
 
 
+# ── Numeric-sort helper ───────────────────────────────────────────────────────
+
+class _NumericSortItem(QTableWidgetItem):
+    """QTableWidgetItem whose sort order is determined by its numeric UserRole.
+
+    Set ``item.setData(Qt.ItemDataRole.UserRole, float_value)`` where the value
+    is the natural sort key.  ``None`` / non-numeric UserRole falls back to the
+    default string comparison so mixed columns are safe.
+
+    Callers should pass ``float("inf")`` for unknown/sentinel values so that
+    "?" or similar display strings sort *last* in ascending order rather than
+    first (as a raw ``-1.0`` would do).
+    """
+
+    def __lt__(self, other: "QTableWidgetItem") -> bool:
+        sv = self.data(Qt.ItemDataRole.UserRole)
+        ov = other.data(Qt.ItemDataRole.UserRole)
+        try:
+            return float(sv) < float(ov)   # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return super().__lt__(other)
+
+
+# ── Remote Assistance Session Browser dialog ──────────────────────────────────
+
+class _RemoteAssistanceDialog(QDialog):
+    """
+    Non-modal dialog listing Remote Assistance / Remote Help / RDP / Quick Assist
+    sessions parsed from multiple Windows event channels.
+
+    Channels covered:
+      • Microsoft-Windows-RemoteAssistance/Operational  (Classic RA — EIDs 1/2/3)
+      • Microsoft-Windows-RemoteHelp/Operational        (Remote Help)
+      • Microsoft-Windows-TerminalServices-*            (RDP — EIDs 21/23/24/25/1149/261)
+      • Security                                        (4624/4634 LogonType=10, 4778/4779)
+      • Security EID 4688                               (Quick Assist process launch)
+
+    *on_filter_fn* is called with ``(related_keys: frozenset, session_info: dict)``
+    when the user chooses "Filter to Session" from the context menu.
+    """
+
+    _HEADERS = [
+        "Type", "Computer", "Start", "End", "Duration",
+        "User", "Remote Host", "Control", "Status", "Events", "Flags",
+    ]
+
+    _TYPE_COLORS: dict[str, str] = {
+        "Classic RA":  "#1e4d8c",
+        "Remote Help": "#2e6820",
+        "RDP Session": "#7a5c1e",
+        "Quick Assist":"#6b1e6b",
+    }
+
+    _BASE_QSS = """
+        QDialog { background: #f5f0e8; }
+        QLabel  { color: #1e1a14; font-size: 9pt; }
+        QLineEdit {
+            background: #faf7f2; color: #1e1a14;
+            border: 1px solid #c4bba8; border-radius: 3px;
+            padding: 2px 6px; font-size: 9pt;
+        }
+        QLineEdit:focus { border-color: #7a5c1e; }
+        QComboBox {
+            background: #faf7f2; color: #1e1a14;
+            border: 1px solid #c4bba8; border-radius: 3px;
+            padding: 2px 6px; font-size: 9pt; min-width: 110px;
+        }
+        QComboBox QAbstractItemView {
+            background: #faf7f2; color: #1e1a14;
+            selection-background-color: #7a5c1e;
+        }
+        QPushButton {
+            background: #e4ddd3; color: #1e1a14;
+            border: 1px solid #c4bba8; border-radius: 3px;
+            padding: 3px 12px; font-size: 9pt;
+        }
+        QPushButton:hover    { background: #d6cdbf; }
+        QPushButton:pressed  { background: #c4bba8; }
+        QPushButton#okBtn {
+            background: #7a5c1e; color: #ffffff;
+            border: 1px solid #5a3e1e;
+        }
+        QPushButton#okBtn:hover   { background: #8a6c2e; }
+        QPushButton#okBtn:pressed { background: #5a3e1e; }
+        QTableWidget {
+            background: #faf7f2; color: #1e1a14;
+            border: 1px solid #c4bba8; gridline-color: #e0d8c4;
+            font-size: 9pt; outline: none;
+        }
+        QTableWidget::item { padding: 1px 4px; }
+        QTableWidget::item:selected {
+            background: #7a5c1e; color: #ffffff;
+        }
+        QHeaderView::section {
+            background: #e4ddd3; color: #1e1a14;
+            border: none; border-right: 1px solid #c4bba8;
+            border-bottom: 1px solid #c4bba8;
+            padding: 3px 6px; font-size: 9pt; font-weight: bold;
+        }
+        QScrollBar:vertical { background: #f5f0e8; width: 8px; margin: 0; }
+        QScrollBar::handle:vertical {
+            background: #5a3e1e; border-radius: 4px; min-height: 20px;
+        }
+        QScrollBar::handle:vertical:hover { background: #7a5c1e; }
+        QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
+        QScrollBar:horizontal { background: #f5f0e8; height: 8px; margin: 0; }
+        QScrollBar::handle:horizontal {
+            background: #5a3e1e; border-radius: 4px; min-width: 20px;
+        }
+        QScrollBar::handle:horizontal:hover { background: #7a5c1e; }
+        QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
+    """
+
+    def __init__(
+        self,
+        events: list[dict],
+        on_filter_fn=None,
+        truncated: bool = False,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._on_filter_fn = on_filter_fn
+        self._truncated    = truncated
+        self._all_sessions:   list[dict] = self._build_sessions(events)
+        self._shown_sessions: list[dict] = list(self._all_sessions)
+        # L6: pre-compute type totals once so _update_summary() never O(n)-scans
+        # all_sessions on every filter interaction.
+        self._by_type_totals: dict[str, int] = {}
+        for _s in self._all_sessions:
+            self._by_type_totals[_s["type"]] = (
+                self._by_type_totals.get(_s["type"], 0) + 1
+            )
+        self._build_ui()
+        self._apply_display_filters()
+
+    # ── Session building ───────────────────────────────────────────────────
+
+    @staticmethod
+    def _build_sessions(events: list[dict]) -> list[dict]:
+        """Parse raw events into Remote Assistance session dicts."""
+        from datetime import datetime as _dt
+
+        _RA_CHAN    = "remoteassistance"
+        _RH_CHAN    = "remotehelp"
+        _TS_CHAN    = "terminalservices"
+        _SEC_CHAN   = "security"
+        _CORR_SECS  = 120.0
+
+        def _parse_ts(ts: str):
+            ts = str(ts or "").strip().rstrip("Z")
+            for fmt in (
+                "%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S",
+                "%Y-%m-%d %H:%M:%S.%f", "%Y-%m-%d %H:%M:%S",
+            ):
+                try:
+                    return _dt.strptime(ts[:26], fmt)
+                except Exception:
+                    pass
+            return None
+
+        def _fmt_ts(d) -> str:
+            return d.strftime("%Y-%m-%d %H:%M:%S") if d else ""
+
+        def _extract_ed(event: dict) -> dict:
+            ed_raw = event.get("event_data") or {}
+            if not isinstance(ed_raw, dict):
+                return {}
+            result: dict = {}
+            # M2 fix: Shape A gate must fire only when there is at least one
+            # *real* field key — not "Data", not "#text", and not an XML-attribute
+            # / metadata prefix ("@..." or "#...").
+            # Old guard: `any(k not in ("Data","#text") for k in ed_raw)` was
+            # triggered by "@Version" (a metadata key), causing the function to
+            # take the Shape A branch, skip all keys (stripped by the "@"/"#"
+            # filter), return {}, and lose all Data entries.
+            # New guard: only enters Shape A when a genuine payload key exists.
+            if any(
+                k not in ("Data", "#text")
+                and not k.startswith("#")
+                and not k.startswith("@")
+                for k in ed_raw
+            ):
+                # L1: skip "Data" key itself; its contents are handled by
+                # Shape B/C below.  Including it here would inject the raw
+                # list/dict repr as a string field value.
+                for k, v in ed_raw.items():
+                    if not k.startswith("#") and not k.startswith("@") and k != "Data":
+                        result[k] = str(v or "")
+                return result
+            data = ed_raw.get("Data")
+            if data is None:
+                for line in str(ed_raw.get("#text", "")).splitlines():
+                    if "=" in line:
+                        k, _, v = line.partition("=")
+                        result[k.strip()] = v.strip()
+                return result
+            if isinstance(data, list):
+                for item in data:
+                    if isinstance(item, dict):
+                        name = item.get("@Name", "")
+                        val  = item.get("#text", "")
+                        if name:
+                            result[str(name)] = str(val or "")
+                return result
+            if isinstance(data, dict):
+                name = data.get("@Name", "")
+                val  = data.get("#text", "")
+                if name:
+                    result[str(name)] = str(val or "")
+            return result
+
+        def _classify(ev: dict, ed: dict) -> tuple | None:
+            """Return (type_label, explicit_grouping_key) or None to skip."""
+            try:
+                eid = int(ev.get("event_id") or 0)
+            except (TypeError, ValueError):
+                eid = 0
+            chan = str(ev.get("channel") or "").lower()
+            if _RA_CHAN in chan:
+                # Use (LocalFQDNName | UserName) as explicit key when available
+                # so distinct concurrent Classic RA sessions on the same host get
+                # separate buckets rather than collapsing into one time cluster.
+                fqdn = ed.get("LocalFQDNName", "").strip().lower()
+                user = ed.get("UserName",      "").strip().lower()
+                key  = f"{fqdn}|{user}" if (fqdn or user) else ""
+                return "Classic RA", key
+            if _RH_CHAN in chan:
+                # SessionId / ConnectionId disambiguates concurrent Remote Help
+                # sessions; fall back to time clustering when absent.
+                sid = (ed.get("SessionId") or ed.get("ConnectionId") or "").strip()
+                return "Remote Help", sid
+            if _TS_CHAN in chan:
+                # Gate on EIDs that are meaningful for session reconstruction;
+                # other TerminalServices operational events (diagnostics, licensing,
+                # etc.) create false sessions without this guard.
+                _TS_EIDS = frozenset({
+                    21,   # LocalSessionManager: session logon
+                    22,   # shell start
+                    23,   # session logoff
+                    24,   # session disconnect
+                    25,   # session reconnect
+                    39,   # session disconnect (alt)
+                    40,   # session logoff (alt)
+                    41,   # session connect (alt)
+                    261,  # RemoteConnectionManager: listener got connection
+                    1149, # RemoteConnectionManager: auth succeeded
+                })
+                if eid not in _TS_EIDS:
+                    return None   # skip unrelated TS operational events
+                sess_id = (ed.get("SessionID") or ed.get("Session") or "").strip()
+                return "RDP Session", sess_id
+            if _SEC_CHAN in chan:
+                if eid in (4624, 4634):
+                    if str(ed.get("LogonType", "")) != "10":
+                        return None   # not remote-interactive
+                    lid = (ed.get("TargetLogonId") or "").strip()
+                    return "RDP Session", lid
+                if eid in (4778, 4779):
+                    lid = (ed.get("TargetLogonId") or "").strip()
+                    return "RDP Session", lid
+                if eid == 4688:
+                    # Broaden: check NewProcessName AND CommandLine AND Application
+                    # so renamed paths and alternate field names are also caught.
+                    _proc_fields = (
+                        str(ed.get("NewProcessName", "")).lower(),
+                        str(ed.get("CommandLine",    "")).lower(),
+                        str(ed.get("Application",    "")).lower(),
+                    )
+                    if any("quickassist" in _f for _f in _proc_fields):
+                        # L3 fix: use NewProcessId as explicit key so each QA
+                        # launch gets its own bucket.  Concurrent launches within
+                        # 120 s no longer collapse into one session row.
+                        # Falls back to time-clustering when the field is absent.
+                        _qa_pid = str(ed.get("NewProcessId") or "").strip()
+                        return "Quick Assist", _qa_pid
+                return None
+            return None
+
+        events_sorted: list[dict] = sorted(
+            events,
+            key=lambda e: (
+                str(e.get("computer") or e.get("source_file") or "").lower(),
+                str(e.get("timestamp") or ""),
+            ),
+        )
+
+        # H1: explicit-key buckets are now also stored as lists so that the same
+        # key value reused across reboots (e.g. RDP SessionID recycling) gets a
+        # new bucket rather than merging into an old one.
+        # _KEY_CORR_SECS is intentionally larger than _CORR_SECS — RDP reconnects
+        # within a 4-hour window should join the same bucket, but sessions from
+        # different days with the same recycled SessionID must not.
+        _KEY_CORR_SECS = 14400.0  # 4 hours
+        open_by_key:  dict = {}   # (computer, type, explicit_key) → list[(last_dt, bucket)]
+        open_by_time: dict = {}   # (computer, type) → list[(last_dt, bucket)]
+        all_buckets:  list = []
+        syn_ctr = [0]
+        # L3: define once outside the event loop (frozenset is constant).
+        _USER_BLOCK = frozenset({
+            "-", "system", "local service", "network service",
+            "anonymous logon", "window manager", "dcom launch",
+            "font driver host", "umfd-0", "umfd-1",
+        })
+
+        def _next_syn() -> str:
+            syn_ctr[0] += 1
+            return f"__syn_{syn_ctr[0]:04d}__"
+
+        def _new_bucket(
+            type_label: str, computer_key: str, key: str,
+            computer_display: str = "",
+        ) -> dict:
+            # Classic RA starts at "No" — EID 2 is the only explicit grant.
+            # All other types start at "Unknown" — no explicit grant event exists
+            # in Windows logs for RDP/Quick Assist/Remote Help.
+            ctrl_default = "No" if type_label == "Classic RA" else "Unknown"
+            b: dict = {
+                "_type": type_label, "_computer": computer_key,
+                # Preserve original casing for UI/export; grouping/lookup uses
+                # the lowercase _computer key, not _computer_display.
+                "_computer_display": computer_display or computer_key,
+                "_key": key,
+                "_events": [], "_start_dt": None, "_end_dt": None,
+                "_has_start": False, "_has_end": False,
+                "_control": ctrl_default, "_user": "", "_remote_host": "",
+            }
+            all_buckets.append(b)
+            return b
+
+        for ev in events_sorted:
+            ed  = _extract_ed(ev)
+            cls = _classify(ev, ed)
+            if cls is None:
+                continue
+            type_label, explicit_key = cls
+            try:
+                eid = int(ev.get("event_id") or 0)
+            except (TypeError, ValueError):
+                eid = 0
+            # L2 + H fix: separate display value (basename) from grouping key.
+            # Display: basename for readability ("Security.evtx").
+            # Grouping key: FULL source_file path (lowercased) so two files
+            # that share the same filename but live in different directories
+            # (e.g. Security.evtx from two different host captures) are never
+            # merged into the same bucket.
+            _comp_val = str(ev.get("computer") or "").strip()
+            _src_val  = str(ev.get("source_file") or "").strip()
+            if _comp_val:
+                computer_raw = _comp_val
+                computer     = _comp_val.lower()
+            elif _src_val:
+                import os as _os_inner
+                computer_raw = _os_inner.path.basename(_src_val) or "(unknown)"
+                computer     = _src_val.lower()   # full path → unique per capture
+            else:
+                computer_raw = "(unknown)"
+                computer     = "(unknown)"
+            dt           = _parse_ts(str(ev.get("timestamp") or ""))
+
+            # ── Bucket selection ──────────────────────────────────────────
+            if explicit_key and explicit_key not in ("0x0", "0", "-1", ""):
+                # H1 fix: maintain a list per explicit key so the same key
+                # value recycled weeks later (RDP SessionID, FQDN|user reuse)
+                # creates a new bucket instead of collapsing into the old one.
+                bk       = (computer, type_label, explicit_key)
+                key_list = open_by_key.setdefault(bk, [])
+                best_bkt:   "dict | None" = None
+                best_delta: "float | None" = None
+                best_idx = -1
+                if dt is not None:
+                    for _i, (_ldt, _bkt) in enumerate(key_list):
+                        if _ldt is None:
+                            continue
+                        _delta = (dt - _ldt).total_seconds()
+                        if 0 <= _delta <= _KEY_CORR_SECS:
+                            if best_delta is None or _delta < best_delta:
+                                best_bkt, best_delta, best_idx = _bkt, _delta, _i
+                if best_bkt is not None:
+                    bucket = best_bkt
+                    key_list[best_idx] = (dt, best_bkt)   # advance last_dt
+                elif dt is None and key_list:
+                    # No timestamp — attach to most recent bucket with this key.
+                    bucket = key_list[-1][1]
+                else:
+                    bucket = _new_bucket(type_label, computer, explicit_key,
+                                         computer_raw)
+                    key_list.append((dt, bucket))
+            else:
+                # Time-based clustering: maintain a LIST of open buckets per
+                # (computer, type) so concurrent same-type sessions on the same
+                # host are not erroneously merged into one bucket.
+                # Pick the open bucket whose last_dt is closest within _CORR_SECS.
+                #
+                # M3 fix: if no time-cluster match exists, also scan explicit-key
+                # buckets for the same (computer, type) — this handles Classic RA
+                # events that carry no LocalFQDNName/UserName (empty key) but
+                # temporally belong to an already-open keyed session on that host.
+                tk        = (computer, type_label)
+                open_list = open_by_time.setdefault(tk, [])
+                bucket:   "dict | None" = None
+                if dt is not None:
+                    best_delta2: "float | None" = None
+                    best_idx2 = -1
+                    for _i, (_ldt, _bkt) in enumerate(open_list):
+                        if _ldt is None:
+                            continue
+                        _delta = (dt - _ldt).total_seconds()
+                        if 0 <= _delta <= _CORR_SECS:
+                            if best_delta2 is None or _delta < best_delta2:
+                                best_delta2, best_idx2 = _delta, _i
+                    if best_idx2 >= 0:
+                        bucket = open_list[best_idx2][1]
+                        open_list[best_idx2] = (dt, bucket)   # advance last_dt
+                    else:
+                        # Spill: check explicit-key buckets (M3)
+                        best_spill: "float | None" = None
+                        for _bk_tuple, _kl in open_by_key.items():
+                            if _bk_tuple[0] != computer or _bk_tuple[1] != type_label:
+                                continue
+                            for _ldt, _bkt in _kl:
+                                if _ldt is None:
+                                    continue
+                                _delta = (dt - _ldt).total_seconds()
+                                if 0 <= _delta <= _CORR_SECS:
+                                    if best_spill is None or _delta < best_spill:
+                                        bucket, best_spill = _bkt, _delta
+                if bucket is None:
+                    syn_key = _next_syn()
+                    bucket  = _new_bucket(type_label, computer, syn_key,
+                                          computer_raw)
+                    open_list.append((dt, bucket))
+
+            bucket["_events"].append(ev)
+
+            # Timestamps
+            if dt is not None:
+                if bucket["_start_dt"] is None or dt < bucket["_start_dt"]:
+                    bucket["_start_dt"] = dt
+                if bucket["_end_dt"] is None or dt > bucket["_end_dt"]:
+                    bucket["_end_dt"] = dt
+
+            # User / remote host (first non-trivial value wins)
+            # L3: _USER_BLOCK defined once above the loop.
+            user = (
+                ed.get("User") or ed.get("TargetUserName") or
+                ed.get("SubjectUserName") or str(ev.get("user_id") or "")
+            ).strip()
+            # Machine-account ("WORKSTATION01$") and domain-prefix strip:
+            # "NT AUTHORITY\SYSTEM".lower() == "nt authority\\system" ≠ "system",
+            # so strip any "DOMAIN\" prefix before blocklist matching (M3 fix).
+            _user_local = (
+                user.rpartition("\\")[2].lower() if "\\" in user else user.lower()
+            )
+            if (user and _user_local not in _USER_BLOCK
+                    and not user.endswith("$") and not bucket["_user"]):
+                bucket["_user"] = user
+            remote = (ed.get("IpAddress") or ed.get("Source") or "").strip()
+            if remote and remote not in ("-", "::1", "127.0.0.1") and not bucket["_remote_host"]:
+                bucket["_remote_host"] = remote
+
+            # EID semantics
+            if type_label == "Classic RA":
+                if eid == 1:
+                    bucket["_has_start"] = True
+                elif eid == 2:
+                    bucket["_control"] = "Yes"   # explicit control grant
+                elif eid == 3:
+                    bucket["_has_end"] = True
+            elif type_label == "RDP Session":
+                if eid in (21, 1149, 4624, 4778):
+                    bucket["_has_start"] = True
+                if eid in (23, 24, 4634, 4779):
+                    bucket["_has_end"] = True
+                # No control assignment — Windows logs carry no explicit RDP
+                # "control granted" event; value stays "Unknown" (set in _new_bucket).
+
+        # ── M2: merge TS-channel and Security-channel RDP buckets ────────────
+        # TerminalServices events use a small integer SessionID as their explicit
+        # key; Security 4624/4634/4778/4779 events use a hex TargetLogonId.  The
+        # two identifiers are never equal, so the same physical RDP connection
+        # produces two separate buckets.  Post-processing: if one bucket contains
+        # exclusively TS-channel events and another on the same computer contains
+        # exclusively Security-channel events AND their time windows overlap within
+        # a 5-minute tolerance, absorb the Security bucket into the TS bucket so
+        # the session row has both the remote-host (from Security) and the
+        # start/end flags (from TS events).
+        def _merge_rdp_buckets(buckets: list) -> None:
+            from datetime import timedelta as _td
+            _MERGE_TOL  = _td(seconds=300)
+            _TS_STR     = "terminalservices"
+            _SEC_STR    = "security"
+
+            def _kind(bkt: dict) -> str:
+                has_ts  = any(_TS_STR  in str(e.get("channel", "")).lower()
+                              for e in bkt["_events"])
+                has_sec = any(_SEC_STR in str(e.get("channel", "")).lower()
+                              for e in bkt["_events"])
+                if has_ts and not has_sec:
+                    return "ts"
+                if has_sec and not has_ts:
+                    return "sec"
+                return "mixed"   # already contains both — no merge needed
+
+            def _overlaps(a: dict, b: dict) -> bool:
+                as_ = a["_start_dt"];  ae = a["_end_dt"] or a["_start_dt"]
+                bs_ = b["_start_dt"];  be = b["_end_dt"] or b["_start_dt"]
+                if as_ is None or bs_ is None:
+                    return False
+                # M1 fix: expand each window outward by tolerance (not inward).
+                # Correct overlap: window A ends within MERGE_TOL of B's start,
+                # or vice versa.
+                return (ae + _MERGE_TOL >= bs_) and (be + _MERGE_TOL >= as_)
+
+            by_comp: dict = {}
+            for bkt in buckets:
+                if bkt["_type"] == "RDP Session" and not bkt.get("_absorbed"):
+                    by_comp.setdefault(bkt["_computer"], []).append(bkt)
+
+            for comp_bkts in by_comp.values():
+                ts_list  = [b for b in comp_bkts if _kind(b) == "ts"]
+                sec_list = [b for b in comp_bkts if _kind(b) == "sec"]
+                for sec_b in sec_list:
+                    if sec_b.get("_absorbed"):
+                        continue
+                    for ts_b in ts_list:
+                        if ts_b.get("_absorbed"):
+                            continue
+                        # User compatibility: skip if both are known and differ.
+                        u_ts  = ts_b["_user"].lower().strip()
+                        u_sec = sec_b["_user"].lower().strip()
+                        if u_ts and u_sec and u_ts != u_sec:
+                            continue
+                        # Remote-host guard: different origin IPs → different
+                        # connections.  Only fires when both sides are populated
+                        # so blank entries (common in TS events) stay neutral.
+                        rh_ts  = ts_b["_remote_host"].strip()
+                        rh_sec = sec_b["_remote_host"].strip()
+                        if rh_ts and rh_sec and rh_ts != rh_sec:
+                            continue
+                        if not _overlaps(ts_b, sec_b):
+                            continue
+                        # Absorb sec_b into ts_b
+                        ts_b["_events"].extend(sec_b["_events"])
+                        for _v in (sec_b["_start_dt"], sec_b["_end_dt"]):
+                            if _v is None:
+                                continue
+                            if ts_b["_start_dt"] is None or _v < ts_b["_start_dt"]:
+                                ts_b["_start_dt"] = _v
+                            if ts_b["_end_dt"]   is None or _v > ts_b["_end_dt"]:
+                                ts_b["_end_dt"]   = _v
+                        if not ts_b["_user"]        and sec_b["_user"]:
+                            ts_b["_user"]        = sec_b["_user"]
+                        if not ts_b["_remote_host"] and sec_b["_remote_host"]:
+                            ts_b["_remote_host"] = sec_b["_remote_host"]
+                        if sec_b["_has_start"]:
+                            ts_b["_has_start"] = True
+                        if sec_b["_has_end"]:
+                            ts_b["_has_end"]   = True
+                        sec_b["_absorbed"] = True
+                        break  # one sec_b merges into at most one ts_b
+
+        _merge_rdp_buckets(all_buckets)
+
+        # ── Build final session dicts ─────────────────────────────────────
+        sessions: list[dict] = []
+        for bkt in all_buckets:
+            if bkt.get("_absorbed"):
+                continue   # M2: this bucket was merged into another
+            evs = bkt["_events"]
+            if not evs:
+                continue
+            type_label = bkt["_type"]
+            start_dt   = bkt["_start_dt"]
+            end_dt     = bkt["_end_dt"]
+            start_ts   = _fmt_ts(start_dt)
+            end_ts     = _fmt_ts(end_dt)
+
+            # Duration
+            if start_dt and end_dt:
+                secs = (end_dt - start_dt).total_seconds()
+                if secs < 0:
+                    dur_str, dur_secs = "⚠ Out-of-order", -1.0
+                else:
+                    h, rem  = divmod(int(secs), 3600)
+                    m, sec  = divmod(rem, 60)
+                    dur_str = (f"{h}h {m:02d}m {sec:02d}s" if h else
+                               f"{m}m {sec:02d}s"          if m else f"{sec}s")
+                    dur_secs = secs
+            else:
+                dur_str, dur_secs = "?", -1.0
+
+            # Status
+            if type_label == "Classic RA":
+                if bkt["_has_start"] and bkt["_has_end"]:
+                    status = "Completed"
+                elif bkt["_has_start"]:
+                    status = "Active / Ongoing"
+                elif bkt["_has_end"]:
+                    status = "Partial (no start)"
+                else:
+                    status = "Unknown"
+            elif type_label == "RDP Session":
+                if bkt["_has_start"] and bkt["_has_end"]:
+                    status = "Completed"
+                elif bkt["_has_start"]:
+                    status = "Active / Ongoing"
+                elif bkt["_has_end"]:
+                    status = "Disconnected (no auth logged)"
+                else:
+                    status = "Unknown"
+            elif type_label == "Remote Help":
+                # L5: Remote Help EID semantics are not publicly documented.
+                # For now status is always "Detected"; future work can wire
+                # specific EIDs to _has_start / _has_end once confirmed.
+                status = "Detected"
+            else:
+                # Quick Assist and any future types
+                status = "Detected"
+
+            # Flags
+            flags: list[str] = []
+            if type_label == "Classic RA" and bkt["_control"] == "Yes":
+                flags.append("CONTROL_GRANTED")
+            if dur_secs < 0 and start_dt and end_dt:
+                flags.append("OUT_OF_ORDER")
+            if len(evs) == 1:
+                flags.append("SINGLE_EVENT")
+
+            # related_keys: (source_file, record_id) composite — used for filter-to-session.
+            # Only include events that have a real record_id; the -1 fallback is
+            # omitted because multiple events from the same source_file could all
+            # map to (source_file, -1) and collide when the filter is applied.
+            # M2 fix: guard int() cast — a non-integer record_id (malformed parse
+            # output) would otherwise raise ValueError and abort all session building.
+            def _safe_rid(v):
+                try:
+                    return int(v)
+                except (TypeError, ValueError):
+                    return None
+
+            related_keys: frozenset = frozenset(
+                (str(e.get("source_file") or ""), _safe_rid(e["record_id"]))
+                for e in evs
+                if e.get("record_id") is not None
+                and _safe_rid(e["record_id"]) is not None
+            )
+
+            sessions.append({
+                "type":          type_label,
+                "session_key":   bkt["_key"],
+                "computer":      bkt.get("_computer_display") or bkt["_computer"],
+                "start_ts":      start_ts,
+                "end_ts":        end_ts,
+                "duration":      dur_str,
+                "duration_secs": dur_secs,
+                "user":          bkt["_user"],
+                "remote_host":   bkt["_remote_host"],
+                "control":       bkt["_control"],
+                "status":        status,
+                "event_count":   len(evs),
+                "flags":         flags,
+                "related_keys":  related_keys,
+            })
+
+        sessions.sort(key=lambda s: s["start_ts"] or "")
+        return sessions
+
+    # ── UI building ────────────────────────────────────────────────────────
+
+    def _build_ui(self) -> None:
+        self.setWindowTitle("Remote Assistance Sessions")
+        self.resize(1150, 650)
+        self.setStyleSheet(self._BASE_QSS)
+        self.setAttribute(Qt.WA_DeleteOnClose)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 10, 12, 10)
+        root.setSpacing(8)
+
+        # ── Filter row ─────────────────────────────────────────────────────
+        frow = QHBoxLayout()
+        frow.setSpacing(6)
+
+        frow.addWidget(QLabel("Type:"))
+        self._cmb_type = QComboBox()
+        self._cmb_type.addItems(
+            ["All Types", "Classic RA", "Remote Help", "RDP Session", "Quick Assist"]
+        )
+        frow.addWidget(self._cmb_type)
+
+        frow.addWidget(QLabel("Status:"))
+        self._cmb_status = QComboBox()
+        self._cmb_status.addItems([
+            "All Statuses", "Completed", "Active / Ongoing",
+            "Partial (no start)", "Disconnected (no auth logged)",
+            "Detected", "Unknown",
+        ])
+        frow.addWidget(self._cmb_status)
+
+        frow.addWidget(QLabel("Search:"))
+        self._txt_search = QLineEdit()
+        self._txt_search.setPlaceholderText("computer / user / remote host…")
+        self._txt_search.setFixedWidth(200)
+        self._txt_search.returnPressed.connect(self._apply_display_filters)
+        frow.addWidget(self._txt_search)
+
+        btn_apply = QPushButton("Apply")
+        btn_apply.setFixedWidth(60)
+        btn_apply.clicked.connect(self._apply_display_filters)
+        frow.addWidget(btn_apply)
+
+        btn_clr = QPushButton("Clear")
+        btn_clr.setFixedWidth(60)
+        btn_clr.clicked.connect(self._clear_filters)
+        frow.addWidget(btn_clr)
+
+        frow.addStretch()
+        root.addLayout(frow)
+
+        # ── Table ──────────────────────────────────────────────────────────
+        self._tbl = QTableWidget(0, len(self._HEADERS))
+        self._tbl.setHorizontalHeaderLabels(self._HEADERS)
+        self._tbl.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._tbl.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self._tbl.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._tbl.setAlternatingRowColors(False)
+        self._tbl.setSortingEnabled(True)
+        self._tbl.verticalHeader().setVisible(False)
+        self._tbl.verticalHeader().setDefaultSectionSize(22)
+        hdr = self._tbl.horizontalHeader()
+        hdr.setStretchLastSection(True)
+        hdr.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
+        self._tbl.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self._tbl.customContextMenuRequested.connect(self._on_context_menu)
+        root.addWidget(self._tbl, 1)
+
+        # ── Summary bar ────────────────────────────────────────────────────
+        self._lbl_summary = QLabel("")
+        self._lbl_summary.setWordWrap(True)
+        self._lbl_summary.setTextFormat(Qt.TextFormat.RichText)
+        self._lbl_summary.setStyleSheet(
+            "background:#faf7f2; border:1px solid #c4bba8;"
+            " border-radius:3px; padding:4px 8px; color:#1e1a14;"
+        )
+        root.addWidget(self._lbl_summary)
+
+        # ── Button row ─────────────────────────────────────────────────────
+        brow = QHBoxLayout()
+        brow.setSpacing(8)
+
+        btn_export = QPushButton("Export CSV…")
+        btn_export.clicked.connect(self._on_export_csv)
+        brow.addWidget(btn_export)
+
+        brow.addStretch()
+
+        btn_close = QPushButton("Close")
+        btn_close.setObjectName("okBtn")
+        btn_close.setFixedWidth(80)
+        btn_close.clicked.connect(self.close)
+        brow.addWidget(btn_close)
+
+        root.addLayout(brow)
+
+    # ── Display logic ──────────────────────────────────────────────────────
+
+    def _apply_display_filters(self) -> None:
+        type_flt   = self._cmb_type.currentText()   if hasattr(self, "_cmb_type")   else "All Types"
+        status_flt = self._cmb_status.currentText() if hasattr(self, "_cmb_status") else "All Statuses"
+        needle     = (self._txt_search.text().strip().lower()
+                      if hasattr(self, "_txt_search") else "")
+
+        shown: list[dict] = []
+        for s in self._all_sessions:
+            if type_flt   != "All Types"    and s["type"]   != type_flt:
+                continue
+            if status_flt != "All Statuses" and s["status"] != status_flt:
+                continue
+            if needle:
+                haystack = " ".join([
+                    s["computer"], s["user"], s["remote_host"],
+                    s["session_key"], s["status"], ", ".join(s["flags"]),
+                ]).lower()
+                if needle not in haystack:
+                    continue
+            shown.append(s)
+
+        self._shown_sessions = shown
+        self._populate_table()
+        self._update_summary()
+
+    def _clear_filters(self) -> None:
+        if hasattr(self, "_cmb_type"):
+            self._cmb_type.setCurrentIndex(0)
+        if hasattr(self, "_cmb_status"):
+            self._cmb_status.setCurrentIndex(0)
+        if hasattr(self, "_txt_search"):
+            self._txt_search.clear()
+        self._apply_display_filters()
+
+    def _populate_table(self) -> None:
+        tbl = self._tbl
+        tbl.setSortingEnabled(False)
+        tbl.setRowCount(0)
+        for orig_row, s in enumerate(self._shown_sessions):
+            r = tbl.rowCount()
+            tbl.insertRow(r)
+            cells = [
+                s["type"],
+                s["computer"],
+                s["start_ts"],
+                s["end_ts"],
+                s["duration"],
+                s["user"],
+                s["remote_host"],
+                s["control"],
+                s["status"],
+                str(s["event_count"]),
+                ", ".join(s["flags"]),
+            ]
+            _COL_TYPE     = 0
+            _COL_DURATION = 4
+            _COL_EVENTS   = 9
+            for c, text in enumerate(cells):
+                if c == _COL_DURATION:
+                    # Numeric sort: unknown/out-of-order durations (duration_secs < 0)
+                    # map to inf so "?" rows sort last in ascending order, not first.
+                    _dsecs = s["duration_secs"]
+                    _sort_key = float("inf") if _dsecs < 0 else _dsecs
+                    item = _NumericSortItem(text)
+                    item.setData(Qt.ItemDataRole.UserRole, _sort_key)
+                elif c == _COL_EVENTS:
+                    # Numeric sort: UserRole = integer event count
+                    item = _NumericSortItem(text)
+                    item.setData(Qt.ItemDataRole.UserRole, s["event_count"])
+                else:
+                    item = QTableWidgetItem(text)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if c == _COL_TYPE:
+                    # Store the shown_sessions index for context-menu lookup.
+                    item.setData(Qt.ItemDataRole.UserRole, orig_row)
+                    color = self._TYPE_COLORS.get(s["type"], "#1e1a14")
+                    item.setForeground(QColor(color))
+                tbl.setItem(r, c, item)
+        tbl.setSortingEnabled(True)
+
+    def _update_summary(self) -> None:
+        total   = len(self._all_sessions)
+        shown   = len(self._shown_sessions)
+        # L6: use the totals cached at construction time (avoid O(n) per filter)
+        by_type = getattr(self, "_by_type_totals", {})
+
+        type_parts = " | ".join(
+            f"<b>{t}</b>: {n}" for t, n in sorted(by_type.items())
+        )
+        html = (
+            f"<span style='color:#1e1a14;'>"
+            f"Showing <b>{shown}</b> of <b>{total}</b> session(s)"
+            f"</span>"
+        )
+        if type_parts:
+            html += f"&ensp;—&ensp;<span style='color:#5a4030;'>{type_parts}</span>"
+        if self._truncated:
+            html += (
+                "&ensp;<span style='color:#8a4800;'>⚠ Results capped at 200,000 events — "
+                "later sessions may be missing</span>"
+            )
+        if hasattr(self, "_lbl_summary"):
+            self._lbl_summary.setText(html)
+
+    # ── Context menu ───────────────────────────────────────────────────────
+
+    def _on_context_menu(self, pos) -> None:
+        from PySide6.QtWidgets import QMenu
+        from PySide6.QtGui     import QGuiApplication
+
+        index = self._tbl.indexAt(pos)
+        if not index.isValid():
+            return
+        self._tbl.selectRow(index.row())
+        cell = self._tbl.item(index.row(), 0)
+        if cell is None:
+            return
+        orig_row = cell.data(Qt.ItemDataRole.UserRole)
+        if orig_row is None or not (0 <= orig_row < len(self._shown_sessions)):
+            return
+        s = self._shown_sessions[orig_row]
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu { background:#2b2b2b; color:#e8e8e8; border:1px solid #555; }"
+            "QMenu::item:selected { background:#4a6fa5; color:white; }"
+            "QMenu::separator { height:1px; background:#555; margin:4px 8px; }"
+        )
+
+        act_type = menu.addAction(f"\U0001f4cb  Copy Type  ({s['type']})")
+        act_type.triggered.connect(
+            lambda: QGuiApplication.clipboard().setText(s["type"])
+        )
+        if s["computer"]:
+            _comp = s["computer"]
+            act_comp = menu.addAction(f"\U0001f4cb  Copy Computer  ({_comp})")
+            act_comp.triggered.connect(lambda: QGuiApplication.clipboard().setText(_comp))
+        if s["user"]:
+            _usr = s["user"]
+            act_usr = menu.addAction(f"\U0001f4cb  Copy User  ({_usr})")
+            act_usr.triggered.connect(lambda: QGuiApplication.clipboard().setText(_usr))
+        if s["remote_host"]:
+            _rh = s["remote_host"]
+            act_rh = menu.addAction(f"\U0001f4cb  Copy Remote Host  ({_rh})")
+            act_rh.triggered.connect(lambda: QGuiApplication.clipboard().setText(_rh))
+
+        if self._on_filter_fn and s["related_keys"]:
+            menu.addSeparator()
+            _rk = s["related_keys"]
+            _si = dict(s)   # snapshot — avoid closure-over-loop-variable issues
+            act_flt = menu.addAction("\U0001f50d  Filter to Session Events")
+            act_flt.triggered.connect(lambda: self._on_filter_fn(_rk, _si))
+
+        menu.exec(self._tbl.viewport().mapToGlobal(pos))
+
+    # ── Export ─────────────────────────────────────────────────────────────
+
+    def _on_export_csv(self) -> None:
+        import csv
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Remote Assistance Sessions",
+            "ra_sessions.csv", "CSV files (*.csv);;All files (*)"
+        )
+        if not path:
+            return
+        try:
+            # Respect the user's current column-sort order when exporting.
+            ordered: list[dict] = []
+            for vis_row in range(self._tbl.rowCount()):
+                cell = self._tbl.item(vis_row, 0)
+                if cell is None:
+                    continue
+                orig = cell.data(Qt.ItemDataRole.UserRole)
+                if orig is not None and 0 <= orig < len(self._shown_sessions):
+                    ordered.append(self._shown_sessions[orig])
+            if not ordered:
+                ordered = list(self._shown_sessions)
+
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.writer(f)
+                if self._truncated:
+                    writer.writerow([
+                        "NOTE: Dataset was capped at 200,000 events — "
+                        "sessions from later in the time range may be missing."
+                    ])
+                # L2 fix: extractors are ordered to match _HEADERS exactly.
+                # Adding a new column to _HEADERS must be accompanied by a
+                # corresponding entry here; the assertion below catches the mismatch
+                # at runtime so a future maintainer cannot silently break the export.
+                _EXTRACTORS = [
+                    lambda s: s["type"],
+                    lambda s: s["computer"],
+                    lambda s: s["start_ts"],
+                    lambda s: s["end_ts"],
+                    lambda s: s["duration"],
+                    lambda s: s["user"],
+                    lambda s: s["remote_host"],
+                    lambda s: s["control"],
+                    lambda s: s["status"],
+                    lambda s: s["event_count"],
+                    lambda s: ", ".join(s["flags"]),
+                ]
+                assert len(_EXTRACTORS) == len(self._HEADERS), (
+                    f"CSV extractors ({len(_EXTRACTORS)}) out of sync with "
+                    f"_HEADERS ({len(self._HEADERS)})"
+                )
+                writer.writerow(self._HEADERS)
+                for s in ordered:
+                    writer.writerow([fn(s) for fn in _EXTRACTORS])
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Failed", f"Could not write CSV:\n{exc}")
+            return
+        # L4: echo the truncation caveat in the success dialog so users
+        # are not surprised by missing sessions in the exported CSV.
+        _trunc_note = (
+            "\n\n⚠ Note: the source dataset was capped at 200,000 events;\n"
+            "sessions from later in the time range may be incomplete."
+            if self._truncated else ""
+        )
+        QMessageBox.information(
+            self, "Export Complete",
+            f"Saved {len(ordered)} session(s) to:\n{path}{_trunc_note}"
+        )
+
+
+# ── Remote Assistance JM background fetch worker ──────────────────────────────
+
+class _RemoteAssistJMFetchWorker(QThread):
+    """Fetch Remote Assistance-related events from Parquet shards (Juggernaut mode).
+
+    Queries five Windows event channels relevant to remote access:
+      • Microsoft-Windows-RemoteAssistance/Operational
+      • Microsoft-Windows-RemoteHelp/Operational
+      • Microsoft-Windows-TerminalServices-LocalSessionManager/Operational
+      • Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational
+      • Security  (EIDs 4624/4634 with LogonType=10, 4778/4779, 4688 QuickAssist)
+
+    Signal naming matches _WifiJMFetchWorker conventions:
+      finished(list, bool)   — (events, was_truncated)
+      fetch_error(str, str)  — (error_kind, detail_message)
+    """
+
+    finished    = Signal(list, bool)   # (list[dict], truncated)
+    fetch_error = Signal(str, str)     # (error_kind, detail_message)
+
+    _RA_CHANNELS = (
+        "Microsoft-Windows-RemoteAssistance/Operational",
+        "Microsoft-Windows-RemoteHelp/Operational",
+        "Microsoft-Windows-TerminalServices-LocalSessionManager/Operational",
+        "Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational",
+    )
+    # Security legs are handled inline in run() with per-leg SQL predicates
+    # (LogonType=10 for 4624/4634, LIKE filter for 4688) rather than a simple
+    # EID IN list — so no class-level _SECURITY_EIDS constant is needed.
+
+    def __init__(self, parquet_dir: str, parent=None) -> None:
+        super().__init__(parent)
+        self._parquet_dir = parquet_dir
+
+    def run(self) -> None:
+        import json  as _json
+        import os    as _os
+        import duckdb as _duckdb
+
+        manifest_path = _os.path.join(self._parquet_dir, "parquet_manifest.json")
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as _f:
+                _raw = _f.read()
+        except FileNotFoundError:
+            logger.error("RA JM [manifest_missing]: %s", manifest_path)
+            self.fetch_error.emit(
+                "manifest_missing",
+                f"Parquet manifest not found:\n{manifest_path}\n\n"
+                "The dataset may have been moved or the JM session was not fully built.",
+            )
+            return
+        except OSError as exc:
+            logger.error("RA JM [manifest_read_error]: %s — %s", manifest_path, exc)
+            self.fetch_error.emit(
+                "manifest_read_error",
+                f"Cannot read Parquet manifest:\n{exc}",
+            )
+            return
+
+        try:
+            shards = _json.loads(_raw)
+        except _json.JSONDecodeError as exc:
+            logger.error("RA JM [manifest_parse_error]: %s — %s", manifest_path, exc)
+            self.fetch_error.emit(
+                "manifest_parse_error",
+                f"Parquet manifest is not valid JSON:\n{exc}",
+            )
+            return
+
+        if not shards:
+            self.finished.emit([], False)
+            return
+
+        shard_list = (
+            "[" + ", ".join(f"'{p.replace(chr(39), chr(39)*2)}'" for p in shards) + "]"
+        )
+        chan_placeholders = ", ".join("?" * len(self._RA_CHANNELS))
+
+        # Four-leg Security filter — each leg as narrow as possible.
+        #
+        #   Leg 1: RA/RH/TS channels — all EIDs (already narrow channels)
+        #   Leg 2: 4778/4779 — always remote; no extra predicate needed
+        #   Leg 3: 4624/4634 — dual predicate covers both JSON shapes:
+        #           • json_extract_string() for flat-dict (dominant shape from evtx parser)
+        #           • LIKE fallback for list-of-Data shape ('@Name':'LogonType','#text':'10')
+        #             so normal/JM parity is preserved even for unusual parsers.
+        #   Leg 4: 4688 — shape-agnostic LIKE on full JSON blob; 'quickassist' never
+        #           appears as a normal field value in non-QA 4688 events, so the
+        #           broad pattern is safe and avoids per-field json_extract calls.
+        sql = (
+            f"SELECT event_id, timestamp_utc, event_data_json, channel, "
+            f"       computer, record_id, source_file "
+            f"FROM parquet_scan({shard_list}) "
+            f"WHERE ("
+            f"    channel IN ({chan_placeholders})"
+            f"    OR (channel = 'Security' AND event_id IN (4778, 4779))"
+            f"    OR (channel = 'Security' AND event_id IN (4624, 4634)"
+            f"        AND ("
+            f"            json_extract_string(event_data_json, '$.LogonType') = '10'"
+            f"            OR event_data_json LIKE '%\"LogonType\": \"10\"%'"
+            f"            OR event_data_json LIKE '%\"LogonType\":\"10\"%'"
+            f"        ))"
+            f"    OR (channel = 'Security' AND event_id = 4688"
+            f"        AND lower(event_data_json) LIKE '%quickassist%')"
+            f") "
+            f"ORDER BY timestamp_utc "
+            f"LIMIT 200001"
+        )
+        params = list(self._RA_CHANNELS)
+
+        try:
+            con = _duckdb.connect()
+            try:
+                rows = con.execute(sql, params).fetchall()
+            finally:
+                con.close()
+        except Exception as exc:
+            logger.error("RA JM [duckdb_query_error]: %s", exc)
+            self.fetch_error.emit("duckdb_query_error", str(exc))
+            return
+
+        truncated = len(rows) > 200_000
+        if truncated:
+            rows = rows[:200_000]
+
+        events: list[dict] = []
+        for eid, ts_utc, ed_json, channel, computer, record_id, source_file in rows:
+            try:
+                ed = _json.loads(ed_json) if ed_json else {}
+            except Exception:
+                ed = {}
+            events.append({
+                "event_id":    eid,
+                "timestamp":   str(ts_utc or ""),
+                "event_data":  ed,
+                "channel":     str(channel or ""),
+                "computer":    str(computer or ""),
+                "record_id":   record_id,
+                "source_file": str(source_file or ""),
+            })
+        self.finished.emit(events, truncated)
+
+
 # ── Add / Remove Columns dialog ───────────────────────────────────────────────
 
 class AddRemoveColumnsDialog(QDialog):
@@ -3533,6 +4667,11 @@ class MainWindow(QMainWindow):
         # with the same record_id from different files are distinguished in merge mode.
         self._bookmarks: list[dict] = []
         self._bookmarked_keys: set[tuple[str, int]] = set()
+        # RA session filter tracking — L1 fix: explicit init so the attribute
+        # is always present and _clear_ra_filter_if_active() can safely reference
+        # it without relying on getattr's default-value fallback.
+        self._ra_filter_active: bool = False
+        self._ra_dlg = None
         # Detail-pane render cache: skip re-building HTML when the same event
         # and display mode are re-selected.  Key: (record_id, source_file, full_mode).
         self._last_detail_key: tuple | None = None
@@ -3639,6 +4778,13 @@ class MainWindow(QMainWindow):
         a = tm.addAction("WiFi History\u2026")
         a.setToolTip("Browse WiFi connection/disconnection history from WLAN-AutoConfig events")
         a.triggered.connect(self._on_show_wifi_history)
+
+        a = tm.addAction("Remote Assistance Sessions\u2026")
+        a.setToolTip(
+            "Browse Remote Assistance, Remote Help, RDP, and Quick Assist sessions "
+            "reconstructed from Windows event logs"
+        )
+        a.triggered.connect(self._on_show_remote_assist)
 
         tm.addSeparator()
         a = tm.addAction("Clear Results")
@@ -4934,6 +6080,7 @@ class MainWindow(QMainWindow):
         # stale session filters against the newly active dataset.
         if self._hw_model is None:
             self._close_logon_sessions_dlg()
+            self._close_ra_dlg()
 
     def _remove_loaded_file(self, filepath: str) -> None:
         """Remove a file completely — close tab + free memory."""
@@ -6231,6 +7378,7 @@ class MainWindow(QMainWindow):
 
         self._events         = events
         self._close_logon_sessions_dlg()   # close + invalidate session browser cache
+        self._close_ra_dlg(clear_filter=True)  # M1: close + clear RA filter + kill worker
         self._attack_summary = attack_summary
         self._iocs           = None
         self._chains         = []
@@ -6901,6 +8049,51 @@ class MainWindow(QMainWindow):
                 pass  # underlying C++ object already destroyed
         self._logon_sessions_dlg = None
 
+    def _clear_ra_filter_if_active(self) -> None:
+        """M1: Remove the RA session bookmark filter from all proxy/model layers.
+
+        Only acts when _ra_filter_active is True — avoids clobbering unrelated
+        filters (user bookmarks, logon-session filter) that happen to use the
+        same underlying set_bookmark_filter() mechanism.
+        """
+        if not getattr(self, "_ra_filter_active", False):
+            return
+        if self._hw_model is not None:
+            self._hw_model.clear_record_id_filter()
+            for _fm in getattr(self, "_jm_file_models", []):
+                _fm.clear_record_id_filter()
+            self._active_jm_session_keys = frozenset()
+        else:
+            self._proxy_model.clear_bookmark_filter()
+            for _state in self._file_tabs.values():
+                _state.proxy.clear_bookmark_filter()
+        self._ra_filter_active = False
+        self._update_count_label()
+
+    def _close_ra_dlg(self, clear_filter: bool = False) -> None:
+        """Close any open Remote Assistance dialog and invalidate in-flight workers.
+
+        Bumping ``_ra_jm_req_id`` ensures that a long-running JM fetch started
+        against the *previous* dataset cannot open a stale dialog after the
+        dataset has been replaced (parse, clear, tab-change, or JM teardown).
+
+        M1: pass ``clear_filter=True`` at dataset-change call sites (parse /
+        clear) so any active RA session filter is removed and does not persist
+        into the new dataset.  Tab-change calls keep the default (False) because
+        the underlying data did not change.
+        """
+        dlg = getattr(self, "_ra_dlg", None)
+        if dlg is not None:
+            try:
+                dlg.close()
+            except RuntimeError:
+                pass
+        self._ra_dlg = None
+        # Invalidate any in-flight fetch worker — the closure checks this token.
+        self._ra_jm_req_id = getattr(self, "_ra_jm_req_id", 0) + 1
+        if clear_filter:
+            self._clear_ra_filter_if_active()
+
     def _on_show_logon_sessions(self) -> None:
         """Open the Logon Session Browser dialog (non-modal)."""
         if self._hw_model is not None:
@@ -7041,6 +8234,159 @@ class MainWindow(QMainWindow):
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
+
+    # ── Remote Assistance session browser ─────────────────────────────────────
+
+    def _on_show_remote_assist(self) -> None:
+        """Open the Remote Assistance Session Browser dialog (non-modal).
+
+        Always discards any previous dialog instance so the session list is
+        rebuilt fresh — prevents serving stale data after a re-parse or file
+        change.  Mirrors the pattern used by _on_show_wifi_history.
+        """
+        existing = getattr(self, "_ra_dlg", None)
+        if existing is not None:
+            try:
+                existing.close()
+            except RuntimeError:
+                pass
+            self._ra_dlg = None
+
+        if self._hw_model is not None:
+            # Juggernaut mode: query Parquet shards on a background thread.
+            parquet_dir = getattr(self, "_hw_db_path", None)
+            if not parquet_dir:
+                QMessageBox.information(
+                    self, "Remote Assistance", "No Juggernaut dataset loaded."
+                )
+                return
+            self._set_status("Fetching Remote Assistance events…")
+            # Monotonic request token — stale results from aborted requests are
+            # silently dropped so they cannot open a dialog after a newer fetch.
+            self._ra_jm_req_id = getattr(self, "_ra_jm_req_id", 0) + 1
+            _req = self._ra_jm_req_id
+
+            worker = _RemoteAssistJMFetchWorker(parquet_dir, parent=self)
+
+            def _on_ready(events, truncated, _r=_req):
+                if getattr(self, "_ra_jm_req_id", None) != _r:
+                    return   # stale — newer request already owns the slot
+                self._on_remote_assist_jm_ready(events, truncated)
+
+            def _on_err(kind, msg, _r=_req):
+                if getattr(self, "_ra_jm_req_id", None) != _r:
+                    return
+                self._on_remote_assist_jm_error(kind, msg)
+
+            worker.finished.connect(_on_ready)
+            worker.fetch_error.connect(_on_err)
+            worker.start()
+            # Keep a strong reference so the worker is not GC'd before it finishes.
+            if not hasattr(self, "_ra_jm_workers"):
+                self._ra_jm_workers = []
+            self._ra_jm_workers = [w for w in self._ra_jm_workers if w.isRunning()]
+            self._ra_jm_workers.append(worker)
+            return
+
+        # Normal mode — events are already in memory.
+        events = self._active_events
+        if not events:
+            QMessageBox.information(self, "Remote Assistance", "No events loaded.")
+            return
+        self._open_remote_assist_dialog(events, truncated=False)
+
+    def _on_remote_assist_jm_ready(self, events: list, truncated: bool) -> None:
+        """Called (via closure) when _RemoteAssistJMFetchWorker succeeds."""
+        self._set_status("")
+        if not events:
+            QMessageBox.information(
+                self, "Remote Assistance",
+                "No Remote Assistance / RDP / Quick Assist events found in the dataset.\n\n"
+                "Channels checked:\n"
+                "  • Microsoft-Windows-RemoteAssistance/Operational\n"
+                "  • Microsoft-Windows-RemoteHelp/Operational\n"
+                "  • Microsoft-Windows-TerminalServices-LocalSessionManager/Operational\n"
+                "  • Microsoft-Windows-TerminalServices-RemoteConnectionManager/Operational\n"
+                "  • Security (EIDs 4624/4634/4688/4778/4779)",
+            )
+            return
+        if truncated:
+            QMessageBox.warning(
+                self, "Remote Assistance — Results Truncated",
+                "The dataset contains more than 200,000 relevant events.\n"
+                "Results are limited to the first 200,000 (chronological order).\n"
+                "Some sessions near the end of the time range may be missing.",
+            )
+        self._open_remote_assist_dialog(events, truncated=truncated)
+
+    def _on_remote_assist_jm_error(self, kind: str, msg: str) -> None:
+        """Show a targeted error dialog based on the classified error kind."""
+        self._set_status("")
+        _TITLES = {
+            "manifest_missing":     "Parquet Manifest Not Found",
+            "manifest_read_error":  "Cannot Read Parquet Manifest",
+            "manifest_parse_error": "Parquet Manifest Corrupt",
+            "duckdb_query_error":   "Remote Assistance Query Failed",
+        }
+        title = _TITLES.get(kind, "Remote Assistance Error")
+        QMessageBox.warning(self, title, msg)
+
+    def _open_remote_assist_dialog(
+        self, events: list, truncated: bool = False
+    ) -> None:
+        """Instantiate and show a fresh _RemoteAssistanceDialog from *events*."""
+        dlg = _RemoteAssistanceDialog(
+            events=events,
+            on_filter_fn=self._set_ra_session_filter,
+            truncated=truncated,
+            parent=self,
+        )
+        self._ra_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _set_ra_session_filter(
+        self, related_keys: frozenset, session_info: dict
+    ) -> None:
+        """Apply a bookmark filter for the chosen Remote Assistance session.
+
+        Works identically to _filter_to_bookmarks but targets the RA session's
+        composite (source_file, record_id) key set rather than user bookmarks.
+
+        Normal mode:  proxy.set_bookmark_filter(related_keys)
+        JM mode:      hw_model.apply_bookmark_filter(related_keys) + all file models
+
+        M1: sets _ra_filter_active = True so _close_ra_dlg(clear_filter=True)
+        can clean up the filter on dataset change without touching unrelated filters.
+        """
+        if not related_keys:
+            self._set_status("No events associated with this Remote Assistance session.")
+            return
+        if self._hw_model is not None:
+            self._hw_model.apply_bookmark_filter(related_keys)
+            for _fm in self._jm_file_models:
+                _fm.apply_bookmark_filter(related_keys)
+            # Remember active keys so tabs opened later inherit this filter.
+            self._active_jm_session_keys = related_keys
+        else:
+            # Apply to the merged main proxy AND every file-tab proxy.
+            # Use _proxy_model (not _active_proxy) as the merged-proxy target:
+            # when a file tab is active, _active_proxy IS a file-tab proxy, so
+            # calling it here AND in the loop below would double-invalidate that proxy.
+            self._proxy_model.set_bookmark_filter(related_keys)
+            for _state in self._file_tabs.values():
+                _state.proxy.set_bookmark_filter(related_keys)
+        self._ra_filter_active = True   # M1: track that RA applied a filter
+        self._update_count_label()
+        n   = len(related_keys)
+        typ = session_info.get("type", "RA")
+        ts  = session_info.get("start_ts", "")
+        self._set_status(
+            f"Filtered to {n} event{'s' if n != 1 else ''} "
+            f"for {typ} session"
+            + (f" starting {ts}" if ts else "")
+        )
 
     # ── Juggernaut Mode — post-parse analysis (Hayabusa) ─────────────────────
 
@@ -9328,6 +10674,7 @@ class MainWindow(QMainWindow):
 
         self._events             = []
         self._close_logon_sessions_dlg()   # close + invalidate session browser cache
+        self._close_ra_dlg(clear_filter=True)  # M1: close + clear RA filter + kill worker
         self._attack_summary     = None
         self._iocs               = None
         self._chains             = []
