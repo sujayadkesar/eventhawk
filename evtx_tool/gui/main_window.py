@@ -3150,6 +3150,26 @@ class _RemoteAssistanceDialog(QDialog):
         _TS_CHAN    = "terminalservices"
         _SEC_CHAN   = "security"
         _CORR_SECS  = 120.0
+        # Explicit-key matching windows.
+        _KEY_CORR_SECS      = 14400.0   # 4h: default explicit-key proximity
+        # For still-open buckets we keep a much wider window than closed buckets
+        # so long-lived sessions with sparse telemetry do not split prematurely.
+        _OPEN_KEY_CORR_SECS = 604800.0  # 7 days
+        # Only these classic RA event IDs carry the start/control/end semantics used below.
+        _RA_EIDS = frozenset({1, 2, 3})
+        # TerminalServices IDs that are session-semantic (exclude diagnostics noise).
+        _TS_EIDS = frozenset({
+            21,   # LocalSessionManager: session logon
+            22,   # shell start
+            23,   # session logoff
+            24,   # session disconnect
+            25,   # session reconnect
+            39,   # session disconnect (alt)
+            40,   # session logoff (alt)
+            41,   # session connect (alt)
+            261,  # RemoteConnectionManager: listener got connection
+            1149, # RemoteConnectionManager: auth succeeded
+        })
 
         def _parse_ts(ts: str):
             ts = str(ts or "").strip().rstrip("Z")
@@ -3222,6 +3242,8 @@ class _RemoteAssistanceDialog(QDialog):
                 eid = 0
             chan = str(ev.get("channel") or "").lower()
             if _RA_CHAN in chan:
+                if eid not in _RA_EIDS:
+                    return None
                 # Use (LocalFQDNName | UserName) as explicit key when available
                 # so distinct concurrent Classic RA sessions on the same host get
                 # separate buckets rather than collapsing into one time cluster.
@@ -3231,25 +3253,22 @@ class _RemoteAssistanceDialog(QDialog):
                 return "Classic RA", key
             if _RH_CHAN in chan:
                 # SessionId / ConnectionId disambiguates concurrent Remote Help
-                # sessions; fall back to time clustering when absent.
-                sid = (ed.get("SessionId") or ed.get("ConnectionId") or "").strip()
+                # sessions.  Require an explicit session key to avoid turning
+                # generic channel noise into synthetic sessions.
+                sid = (
+                    ed.get("SessionId")
+                    or ed.get("SessionID")
+                    or ed.get("ConnectionId")
+                    or ed.get("ConnectionID")
+                    or ""
+                ).strip()
+                if not sid:
+                    return None
                 return "Remote Help", sid
             if _TS_CHAN in chan:
                 # Gate on EIDs that are meaningful for session reconstruction;
                 # other TerminalServices operational events (diagnostics, licensing,
                 # etc.) create false sessions without this guard.
-                _TS_EIDS = frozenset({
-                    21,   # LocalSessionManager: session logon
-                    22,   # shell start
-                    23,   # session logoff
-                    24,   # session disconnect
-                    25,   # session reconnect
-                    39,   # session disconnect (alt)
-                    40,   # session logoff (alt)
-                    41,   # session connect (alt)
-                    261,  # RemoteConnectionManager: listener got connection
-                    1149, # RemoteConnectionManager: auth succeeded
-                })
                 if eid not in _TS_EIDS:
                     return None   # skip unrelated TS operational events
                 sess_id = (ed.get("SessionID") or ed.get("Session") or "").strip()
@@ -3272,12 +3291,14 @@ class _RemoteAssistanceDialog(QDialog):
                         str(ed.get("Application",    "")).lower(),
                     )
                     if any("quickassist" in _f for _f in _proc_fields):
-                        # L3 fix: use NewProcessId as explicit key so each QA
-                        # launch gets its own bucket.  Concurrent launches within
-                        # 120 s no longer collapse into one session row.
-                        # Falls back to time-clustering when the field is absent.
+                        # Use a composite key to reduce PID-reuse collisions.
                         _qa_pid = str(ed.get("NewProcessId") or "").strip()
-                        return "Quick Assist", _qa_pid
+                        _qa_img = str(
+                            ed.get("NewProcessName") or ed.get("Application") or ""
+                        ).strip().lower()
+                        _qa_ts  = str(ev.get("timestamp") or "").strip()[:19]
+                        _qa_key = "|".join([x for x in (_qa_pid, _qa_img, _qa_ts) if x])
+                        return "Quick Assist", _qa_key
                 return None
             return None
 
@@ -3289,13 +3310,10 @@ class _RemoteAssistanceDialog(QDialog):
             ),
         )
 
-        # H1: explicit-key buckets are now also stored as lists so that the same
-        # key value reused across reboots (e.g. RDP SessionID recycling) gets a
-        # new bucket rather than merging into an old one.
-        # _KEY_CORR_SECS is intentionally larger than _CORR_SECS — RDP reconnects
-        # within a 4-hour window should join the same bucket, but sessions from
-        # different days with the same recycled SessionID must not.
-        _KEY_CORR_SECS = 14400.0  # 4 hours
+        # Explicit-key buckets are stored as lists so the same key value reused
+        # later can create a new bucket instead of collapsing into an old one.
+        # Still-open buckets are allowed a larger match window to avoid splitting
+        # long-running sessions that emit sparse events.
         open_by_key:  dict = {}   # (computer, type, explicit_key) → list[(last_dt, bucket)]
         open_by_time: dict = {}   # (computer, type) → list[(last_dt, bucket)]
         all_buckets:  list = []
@@ -3306,6 +3324,21 @@ class _RemoteAssistanceDialog(QDialog):
             "anonymous logon", "window manager", "dcom launch",
             "font driver host", "umfd-0", "umfd-1",
         })
+
+        def _norm_user_for_match(raw: str) -> str:
+            user = str(raw or "").strip()
+            if not user:
+                return ""
+            local = user.rpartition("\\")[2].lower() if "\\" in user else user.lower()
+            if local in _USER_BLOCK or local.endswith("$"):
+                return ""
+            return local
+
+        def _norm_remote_for_match(raw: str) -> str:
+            r = str(raw or "").strip().lower()
+            if r in ("", "-", "::1", "127.0.0.1"):
+                return ""
+            return r
 
         def _next_syn() -> str:
             syn_ctr[0] += 1
@@ -3328,6 +3361,7 @@ class _RemoteAssistanceDialog(QDialog):
                 "_events": [], "_start_dt": None, "_end_dt": None,
                 "_has_start": False, "_has_end": False,
                 "_control": ctrl_default, "_user": "", "_remote_host": "",
+                "_user_norm": "", "_remote_norm": "",
             }
             all_buckets.append(b)
             return b
@@ -3361,6 +3395,15 @@ class _RemoteAssistanceDialog(QDialog):
                 computer_raw = "(unknown)"
                 computer     = "(unknown)"
             dt           = _parse_ts(str(ev.get("timestamp") or ""))
+            _ev_user_norm = _norm_user_for_match(
+                ed.get("User")
+                or ed.get("TargetUserName")
+                or ed.get("SubjectUserName")
+                or str(ev.get("user_id") or "")
+            )
+            _ev_remote_norm = _norm_remote_for_match(
+                ed.get("IpAddress") or ed.get("Source") or ""
+            )
 
             # ── Bucket selection ──────────────────────────────────────────
             if explicit_key and explicit_key not in ("0x0", "0", "-1", ""):
@@ -3377,7 +3420,27 @@ class _RemoteAssistanceDialog(QDialog):
                         if _ldt is None:
                             continue
                         _delta = (dt - _ldt).total_seconds()
-                        if 0 <= _delta <= _KEY_CORR_SECS:
+                        _max_corr = (
+                            _OPEN_KEY_CORR_SECS
+                            if not _bkt.get("_has_end")
+                            else _KEY_CORR_SECS
+                        )
+                        if 0 <= _delta <= _max_corr:
+                            # Long-gap explicit-key matches are high-risk for
+                            # recycled IDs. Require corroborating identity.
+                            if _delta > _KEY_CORR_SECS:
+                                _user_match = bool(
+                                    _bkt.get("_user_norm")
+                                    and _ev_user_norm
+                                    and _bkt["_user_norm"] == _ev_user_norm
+                                )
+                                _remote_match = bool(
+                                    _bkt.get("_remote_norm")
+                                    and _ev_remote_norm
+                                    and _bkt["_remote_norm"] == _ev_remote_norm
+                                )
+                                if not (_user_match or _remote_match):
+                                    continue
                             if best_delta is None or _delta < best_delta:
                                 best_bkt, best_delta, best_idx = _bkt, _delta, _i
                 if best_bkt is not None:
@@ -3459,9 +3522,11 @@ class _RemoteAssistanceDialog(QDialog):
             if (user and _user_local not in _USER_BLOCK
                     and not user.endswith("$") and not bucket["_user"]):
                 bucket["_user"] = user
+                bucket["_user_norm"] = _user_local
             remote = (ed.get("IpAddress") or ed.get("Source") or "").strip()
             if remote and remote not in ("-", "::1", "127.0.0.1") and not bucket["_remote_host"]:
                 bucket["_remote_host"] = remote
+                bucket["_remote_norm"] = _ev_remote_norm
 
             # EID semantics
             if type_label == "Classic RA":
@@ -3527,6 +3592,8 @@ class _RemoteAssistanceDialog(QDialog):
                 for sec_b in sec_list:
                     if sec_b.get("_absorbed"):
                         continue
+                    candidates: list[tuple[bool, float, dict]] = []
+                    sec_ref = sec_b["_start_dt"] or sec_b["_end_dt"]
                     for ts_b in ts_list:
                         if ts_b.get("_absorbed"):
                             continue
@@ -3544,25 +3611,44 @@ class _RemoteAssistanceDialog(QDialog):
                             continue
                         if not _overlaps(ts_b, sec_b):
                             continue
-                        # Absorb sec_b into ts_b
-                        ts_b["_events"].extend(sec_b["_events"])
-                        for _v in (sec_b["_start_dt"], sec_b["_end_dt"]):
-                            if _v is None:
-                                continue
-                            if ts_b["_start_dt"] is None or _v < ts_b["_start_dt"]:
-                                ts_b["_start_dt"] = _v
-                            if ts_b["_end_dt"]   is None or _v > ts_b["_end_dt"]:
-                                ts_b["_end_dt"]   = _v
-                        if not ts_b["_user"]        and sec_b["_user"]:
-                            ts_b["_user"]        = sec_b["_user"]
-                        if not ts_b["_remote_host"] and sec_b["_remote_host"]:
-                            ts_b["_remote_host"] = sec_b["_remote_host"]
-                        if sec_b["_has_start"]:
-                            ts_b["_has_start"] = True
-                        if sec_b["_has_end"]:
-                            ts_b["_has_end"]   = True
-                        sec_b["_absorbed"] = True
-                        break  # one sec_b merges into at most one ts_b
+                        corroborated = bool(
+                            (u_ts and u_sec and u_ts == u_sec)
+                            or (rh_ts and rh_sec and rh_ts == rh_sec)
+                        )
+                        ts_ref = ts_b["_start_dt"] or ts_b["_end_dt"]
+                        if sec_ref is not None and ts_ref is not None:
+                            dist = abs((sec_ref - ts_ref).total_seconds())
+                        else:
+                            dist = float("inf")
+                        candidates.append((corroborated, dist, ts_b))
+                    if not candidates:
+                        continue
+                    corroborated = [c for c in candidates if c[0]]
+                    if corroborated:
+                        _ts_pick = min(corroborated, key=lambda t: t[1])[2]
+                    else:
+                        # Require at least one strong positive join key (user or
+                        # remote-host match).  Overlap-only merges are too risky.
+                        continue
+                    ts_b = _ts_pick
+                    # Absorb sec_b into ts_b
+                    ts_b["_events"].extend(sec_b["_events"])
+                    for _v in (sec_b["_start_dt"], sec_b["_end_dt"]):
+                        if _v is None:
+                            continue
+                        if ts_b["_start_dt"] is None or _v < ts_b["_start_dt"]:
+                            ts_b["_start_dt"] = _v
+                        if ts_b["_end_dt"]   is None or _v > ts_b["_end_dt"]:
+                            ts_b["_end_dt"]   = _v
+                    if not ts_b["_user"]        and sec_b["_user"]:
+                        ts_b["_user"]        = sec_b["_user"]
+                    if not ts_b["_remote_host"] and sec_b["_remote_host"]:
+                        ts_b["_remote_host"] = sec_b["_remote_host"]
+                    if sec_b["_has_start"]:
+                        ts_b["_has_start"] = True
+                    if sec_b["_has_end"]:
+                        ts_b["_has_end"]   = True
+                    sec_b["_absorbed"] = True
 
         _merge_rdp_buckets(all_buckets)
 
@@ -3592,6 +3678,9 @@ class _RemoteAssistanceDialog(QDialog):
                                f"{m}m {sec:02d}s"          if m else f"{sec}s")
                     dur_secs = secs
             else:
+                dur_str, dur_secs = "?", -1.0
+            if len(evs) == 1 and not (bkt["_has_start"] and bkt["_has_end"]):
+                # Single-point evidence cannot prove elapsed session duration.
                 dur_str, dur_secs = "?", -1.0
 
             # Status
@@ -3643,12 +3732,21 @@ class _RemoteAssistanceDialog(QDialog):
                 except (TypeError, ValueError):
                     return None
 
-            related_keys: frozenset = frozenset(
-                (str(e.get("source_file") or ""), _safe_rid(e["record_id"]))
-                for e in evs
-                if e.get("record_id") is not None
-                and _safe_rid(e["record_id"]) is not None
-            )
+            _pairs: set[tuple[str, int]] = set()
+            _unfilterable_count = 0
+            for e in evs:
+                _rid_raw = e.get("record_id")
+                if _rid_raw is None:
+                    _unfilterable_count += 1
+                    continue
+                _rid = _safe_rid(_rid_raw)
+                if _rid is None:
+                    _unfilterable_count += 1
+                    continue
+                _pairs.add((str(e.get("source_file") or ""), _rid))
+            related_keys: frozenset = frozenset(_pairs)
+            if _unfilterable_count > 0:
+                flags.append(f"UNFILTERABLE_EVENTS:{_unfilterable_count}")
 
             sessions.append({
                 "type":          type_label,
@@ -3663,6 +3761,8 @@ class _RemoteAssistanceDialog(QDialog):
                 "control":       bkt["_control"],
                 "status":        status,
                 "event_count":   len(evs),
+                "filterable_event_count": len(related_keys),
+                "unfilterable_event_count": _unfilterable_count,
                 "flags":         flags,
                 "related_keys":  related_keys,
             })
@@ -4076,13 +4176,10 @@ class _RemoteAssistJMFetchWorker(QThread):
         #
         #   Leg 1: RA/RH/TS channels — all EIDs (already narrow channels)
         #   Leg 2: 4778/4779 — always remote; no extra predicate needed
-        #   Leg 3: 4624/4634 — dual predicate covers both JSON shapes:
-        #           • json_extract_string() for flat-dict (dominant shape from evtx parser)
-        #           • LIKE fallback for list-of-Data shape ('@Name':'LogonType','#text':'10')
-        #             so normal/JM parity is preserved even for unusual parsers.
-        #   Leg 4: 4688 — shape-agnostic LIKE on full JSON blob; 'quickassist' never
-        #           appears as a normal field value in non-QA 4688 events, so the
-        #           broad pattern is safe and avoids per-field json_extract calls.
+        #   Leg 3: 4624/4634 — detect LogonType=10 in both flat-dict and list-of-Data
+        #           event_data shapes.
+        #   Leg 4: 4688 — Quick Assist process detection with normal-mode parity:
+        #           NewProcessName OR CommandLine OR Application (plus list-of-Data fallback).
         sql = (
             f"SELECT event_id, timestamp_utc, event_data_json, channel, "
             f"       computer, record_id, source_file "
@@ -4095,9 +4192,53 @@ class _RemoteAssistJMFetchWorker(QThread):
             f"            json_extract_string(event_data_json, '$.LogonType') = '10'"
             f"            OR event_data_json LIKE '%\"LogonType\": \"10\"%'"
             f"            OR event_data_json LIKE '%\"LogonType\":\"10\"%'"
+            f"            OR ("
+            f"                ("
+            f"                    lower(event_data_json) LIKE '%\"@name\":\"logontype\"%'"
+            f"                    OR lower(event_data_json) LIKE '%\"@name\": \"logontype\"%'"
+            f"                )"
+            f"                AND ("
+                    f"                    lower(event_data_json) LIKE '%\"#text\":\"10\"%'"
+                    f"                    OR lower(event_data_json) LIKE '%\"#text\": \"10\"%'"
+                f"                )"
+            f"            )"
             f"        ))"
             f"    OR (channel = 'Security' AND event_id = 4688"
-            f"        AND lower(event_data_json) LIKE '%quickassist%')"
+            f"        AND ("
+            f"            lower(coalesce(json_extract_string(event_data_json, '$.NewProcessName'), '')) LIKE '%quickassist%'"
+            f"            OR lower(coalesce(json_extract_string(event_data_json, '$.CommandLine'), '')) LIKE '%quickassist%'"
+            f"            OR lower(coalesce(json_extract_string(event_data_json, '$.Application'), '')) LIKE '%quickassist%'"
+            f"            OR ("
+            f"                ("
+            f"                    lower(event_data_json) LIKE '%\"@name\":\"newprocessname\"%'"
+            f"                    OR lower(event_data_json) LIKE '%\"@name\": \"newprocessname\"%'"
+            f"                )"
+            f"                AND ("
+            f"                    lower(event_data_json) LIKE '%\"#text\":\"%quickassist%'"
+            f"                    OR lower(event_data_json) LIKE '%\"#text\": \"%quickassist%'"
+            f"                )"
+            f"            )"
+            f"            OR ("
+            f"                ("
+            f"                    lower(event_data_json) LIKE '%\"@name\":\"commandline\"%'"
+            f"                    OR lower(event_data_json) LIKE '%\"@name\": \"commandline\"%'"
+            f"                )"
+            f"                AND ("
+            f"                    lower(event_data_json) LIKE '%\"#text\":\"%quickassist%'"
+            f"                    OR lower(event_data_json) LIKE '%\"#text\": \"%quickassist%'"
+            f"                )"
+            f"            )"
+            f"            OR ("
+            f"                ("
+            f"                    lower(event_data_json) LIKE '%\"@name\":\"application\"%'"
+            f"                    OR lower(event_data_json) LIKE '%\"@name\": \"application\"%'"
+            f"                )"
+            f"                AND ("
+            f"                    lower(event_data_json) LIKE '%\"#text\":\"%quickassist%'"
+            f"                    OR lower(event_data_json) LIKE '%\"#text\": \"%quickassist%'"
+            f"                )"
+            f"            )"
+            f"        ))"
             f") "
             f"ORDER BY timestamp_utc "
             f"LIMIT 200001"
@@ -7769,6 +7910,11 @@ class MainWindow(QMainWindow):
         session LogonId filter, ATT&CK tactic filter, bookmark/IOC pivot
         (record-ID filter).  Safe to call even when no filters are active.
         """
+        # RA session filters are implemented on top of the bookmark/record-id
+        # filter layer.  Clear the ownership flag up front so a later dataset
+        # change cannot accidentally re-clear a different bookmark filter.
+        self._ra_filter_active = False
+
         # 1. Advanced filter
         self._adv_filter_cfg = None
 
